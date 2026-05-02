@@ -1,0 +1,6 @@
+name = "unoir-studio"
+roles = ["frontend", "backend"]
+webhooks_path = "/webhooks"
+
+[commands]
+dev = "npm exec remix vite:dev"

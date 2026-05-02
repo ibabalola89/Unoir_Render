@@ -1,0 +1,70 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model ProcessingJob {
+  id          String           @id @default(cuid())
+  shop        String
+  status      String           @default("queued")
+  background  String
+  totalImages Int
+  idempotencyKey String?
+  completedAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  images      ProcessedImage[]
+
+  @@index([shop, createdAt])
+  @@unique([shop, idempotencyKey])
+}
+
+model ProcessedImage {
+  id                  String        @id @default(cuid())
+  jobId               String
+  job                 ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  shopifyMediaId      String
+  shopifyProductId    String
+  shopifyAltText      String?
+  originalUrl         String
+  originalBackupKey   String?
+  processedKey        String?
+  status              String        @default("pending")
+  errorMessage        String?
+  processingStartedAt DateTime?
+  recoveryAttempts    Int           @default(0)
+  lastRecoveryAt      DateTime?
+  recoveryReason      String?
+  publishedMediaId    String?
+  publishMode         String?
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  @@index([jobId])
+  @@index([shopifyProductId])
+  @@index([status, processingStartedAt])
+}

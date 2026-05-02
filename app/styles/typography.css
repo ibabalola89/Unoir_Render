@@ -1,0 +1,113 @@
+:root {
+    --unoir-font-ui: Inter, -apple-system, BlinkMacSystemFont, "San Francisco", "Segoe UI", sans-serif;
+    --unoir-font-display: Canela, "Canela Web", "Canela Text", Georgia, "Times New Roman", serif;
+
+    --unoir-text-hero: clamp(3rem, 7vw, 5.8rem);
+    --unoir-text-display: clamp(2.6rem, 6vw, 4.8rem);
+    --unoir-text-app-hero: 2.25rem;
+    --unoir-text-hero-mobile: 3.2rem;
+    --unoir-text-metric: 3rem;
+    --unoir-text-card-title: 1.125rem;
+    --unoir-text-section: 1rem;
+    --unoir-text-body: 0.9375rem;
+    --unoir-text-body-sm: 0.875rem;
+    --unoir-text-label: 0.75rem;
+    --unoir-text-chip: 0.75rem;
+    --unoir-text-progress: 0.8125rem;
+    --unoir-text-micro: 0.6875rem;
+
+    --unoir-weight-regular: 400;
+    --unoir-weight-medium: 500;
+    --unoir-weight-semibold: 600;
+    --unoir-weight-bold: 700;
+    --unoir-display-medium: 500;
+    --unoir-display-bold: 700;
+
+    --unoir-line-tight: 1.16;
+    --unoir-line-title: 1.24;
+    --unoir-line-body: 1.52;
+    --unoir-line-loose: 1.68;
+
+    --unoir-tracking-none: 0;
+    --unoir-tracking-label: 0.06em;
+
+    --unoir-space-2xs: 2px;
+    --unoir-space-xs: 4px;
+    --unoir-space-sm: 8px;
+    --unoir-space-md: 12px;
+    --unoir-space-lg: 16px;
+    --unoir-space-xl: 24px;
+    --unoir-space-2xl: 32px;
+    --unoir-space-3xl: 48px;
+
+    --unoir-surface-ink: #0f0f0d;
+    --unoir-surface-ink-raised: #151515;
+    --unoir-surface-ink-deep: #080808;
+    --unoir-surface-light: #fff;
+    --unoir-surface-warm: #f7f5ef;
+    --unoir-text-strong: #fffdf7;
+    --unoir-text-light: #f7f5ef;
+    --unoir-text-muted: #8f897f;
+    --unoir-text-dark: #191815;
+    --unoir-text-dark-muted: #6f6a62;
+    --unoir-border-light: #dedbd4;
+    --unoir-border-light-soft: #e5e1d8;
+    --unoir-border-dark: rgba(255, 255, 255, 0.1);
+    --unoir-border-dark-soft: rgba(255, 255, 255, 0.08);
+
+    --unoir-radius-control: 7px;
+    --unoir-radius-card: 8px;
+    --unoir-radius-chip: 6px;
+    --unoir-radius-round: 999px;
+
+    --unoir-button-height: 40px;
+    --unoir-button-height-large: 44px;
+    --unoir-button-padding-x: 16px;
+    --unoir-chip-height: 24px;
+    --unoir-chip-padding-x: 8px;
+    --unoir-progress-height: 6px;
+
+    --unoir-card-padding: 16px;
+    --unoir-panel-padding: 24px;
+    --unoir-section-gap: 32px;
+    --unoir-card-gap: 16px;
+    --unoir-meta-gap: 8px;
+
+    --unoir-shadow-card: 0 1px 0 rgba(17, 17, 17, 0.03), 0 12px 28px rgba(17, 17, 17, 0.045);
+    --unoir-shadow-card-hover: 0 1px 0 rgba(17, 17, 17, 0.04), 0 16px 34px rgba(17, 17, 17, 0.06);
+    --unoir-shadow-panel: 0 20px 56px rgba(0, 0, 0, 0.32);
+    --unoir-shadow-action: 0 8px 22px rgba(255, 249, 237, 0.12);
+    --unoir-shadow-marker: 0 8px 22px rgba(0, 0, 0, 0.24);
+
+    --unoir-min-onboarding-step: 170px;
+    --unoir-min-launch-shell: 520px;
+    --unoir-min-hero-frame: 330px;
+    --unoir-min-empty-state: 260px;
+    --unoir-min-finish-option: 70px;
+    --unoir-min-landing-preview: 320px;
+    --unoir-min-landing-preview-mobile: 260px;
+    --unoir-min-landing-preview-art: 292px;
+    --unoir-min-landing-preview-art-mobile: 244px;
+
+    --unoir-motion-fast: 140ms ease;
+    --unoir-motion-base: 160ms ease;
+    --unoir-motion-reveal: 700ms ease-out;
+    --unoir-motion-ambient: 8s ease-in-out;
+}
+
+html,
+body {
+    font-family: var(--unoir-font-ui);
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    text-size-adjust: 100%;
+}
+
+button,
+input,
+select,
+textarea {
+    font: inherit;
+}

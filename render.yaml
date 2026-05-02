@@ -1,0 +1,92 @@
+services:
+  - type: web
+    name: unoir-studio-web
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run check:production-config && npm run prisma:generate:production && npm run build
+    preDeployCommand: npm run check:production-env && npm run prisma:migrate:production
+    startCommand: npm run check:production-env && npm run start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHOPIFY_APP_URL
+        value: https://www.unoir.studio
+      - key: SCOPES
+        value: read_products,write_products
+      - key: PROCESS_JOBS_PER_HOUR
+        value: 5
+      - key: DATABASE_URL
+        fromDatabase:
+          name: unoir-studio-db
+          property: connectionString
+      - key: REDIS_URL
+        sync: false
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: REMOVE_BG_API_KEY
+        sync: false
+      - key: STORAGE_BUCKET
+        sync: false
+      - key: STORAGE_REGION
+        sync: false
+      - key: STORAGE_ENDPOINT
+        sync: false
+      - key: STORAGE_ACCESS_KEY
+        sync: false
+      - key: STORAGE_SECRET_KEY
+        sync: false
+      - key: STORAGE_PUBLIC_BASE_URL
+        sync: false
+      - key: INTERNAL_OPS_SHOPS
+        sync: false
+
+  - type: worker
+    name: unoir-studio-worker
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npm run check:production-config && npm run prisma:generate:production && npm run build
+    startCommand: npm run check:production-env && npm run worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHOPIFY_APP_URL
+        value: https://www.unoir.studio
+      - key: SCOPES
+        value: read_products,write_products
+      - key: DATABASE_URL
+        fromDatabase:
+          name: unoir-studio-db
+          property: connectionString
+      - key: REDIS_URL
+        sync: false
+      - key: WORKER_CONCURRENCY
+        value: 4
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: REMOVE_BG_API_KEY
+        sync: false
+      - key: STORAGE_BUCKET
+        sync: false
+      - key: STORAGE_REGION
+        sync: false
+      - key: STORAGE_ENDPOINT
+        sync: false
+      - key: STORAGE_ACCESS_KEY
+        sync: false
+      - key: STORAGE_SECRET_KEY
+        sync: false
+      - key: STORAGE_PUBLIC_BASE_URL
+        sync: false
+      - key: INTERNAL_OPS_SHOPS
+        sync: false
+
+databases:
+  - name: unoir-studio-db
+    plan: starter
+    databaseName: unoir_studio
+    user: unoir_studio

@@ -1,0 +1,79 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// A bulk background-removal job (Phase 3).
+// Max 50 images per job (V1 hardcoded).
+model ProcessingJob {
+  id          String              @id @default(cuid())
+  shop        String
+  status      String              @default("queued") // queued|completed|failed
+  background  String              // curated background id
+  totalImages Int
+  idempotencyKey String?
+  completedAt DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  images      ProcessedImage[]
+
+  @@index([shop, createdAt])
+  @@unique([shop, idempotencyKey])
+}
+
+// A single image inside a job. Tracks before/after + approval + publish state.
+model ProcessedImage {
+  id              String        @id @default(cuid())
+  jobId           String
+  job             ProcessingJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  shopifyMediaId  String        // Shopify media GID
+  shopifyProductId String
+  shopifyAltText   String?
+  originalUrl     String        // Shopify CDN source URL (for worker download)
+  originalBackupKey String?     // S3 key for our backup of the original
+  processedKey      String?     // S3 key for processed bytes
+  status          String        @default("pending") // pending|processing|processed|approved|rejected|published|failed
+  errorMessage    String?
+  processingStartedAt DateTime?
+  recoveryAttempts Int          @default(0)
+  lastRecoveryAt   DateTime?
+  recoveryReason   String?
+  publishedMediaId String?      // Shopify media GID after publish
+  publishMode      String?      // append|replace_primary, captured when published
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([jobId])
+  @@index([shopifyProductId])
+  @@index([status, processingStartedAt])
+}

@@ -1,0 +1,45 @@
+# Production Shopify config.
+#
+# Production app origin for Unoir Studio.
+
+client_id = "a5fd4e148c2b1ca3e792f60dbe83cb5e"
+name = "Unoir Studio"
+application_url = "https://www.unoir.studio"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+include_config_on_deploy = true
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "customers/data_request" ]
+  uri = "/webhooks/customers/data_request"
+
+  [[webhooks.subscriptions]]
+  topics = [ "customers/redact" ]
+  uri = "/webhooks/customers/redact"
+
+  [[webhooks.subscriptions]]
+  topics = [ "shop/redact" ]
+  uri = "/webhooks/shop/redact"
+
+[access_scopes]
+scopes = "read_products,write_products"
+
+[auth]
+redirect_urls = [
+  "https://www.unoir.studio/auth/callback",
+  "https://www.unoir.studio/auth/shopify/callback",
+  "https://www.unoir.studio/api/auth/callback"
+]
