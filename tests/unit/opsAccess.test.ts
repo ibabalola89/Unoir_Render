@@ -48,7 +48,13 @@ describe("ops dashboard access", () => {
         ).toBe(false);
     });
 
-    it("stays reachable in development without an allowlist", () => {
-        expect(isOpsShopAllowed("dev.myshopify.com", { NODE_ENV: "development" })).toBe(true);
+    it("requires an explicit allowlist in development", () => {
+        expect(isOpsShopAllowed("dev.myshopify.com", { NODE_ENV: "development" })).toBe(false);
+        expect(
+            isOpsShopAllowed("dev.myshopify.com", {
+                NODE_ENV: "development",
+                INTERNAL_OPS_SHOPS: "dev.myshopify.com",
+            }),
+        ).toBe(true);
     });
 });

@@ -6,7 +6,7 @@ export function isOpsShopAllowed(shop: string | null | undefined, env = process.
     const allowlist = parseOpsShopAllowlist(env[OPS_SHOPS_ENV]);
     if (allowlist.invalid.length > 0) return false;
     const allowedShops = allowlist.shops;
-    if (allowedShops.size === 0) return env.NODE_ENV !== "production";
+    if (allowedShops.size === 0) return false;
     return allowedShops.has(shop.trim().toLowerCase());
 }
 

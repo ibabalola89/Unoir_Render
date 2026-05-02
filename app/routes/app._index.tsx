@@ -1,14 +1,6 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { Link, useLoaderData } from "@remix-run/react";
-import {
-  Page,
-  Text,
-  Card,
-  BlockStack,
-  Badge,
-  InlineStack,
-  Button,
-} from "@shopify/polaris";
+import { Page, BlockStack, Badge, Button } from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { AppNotice } from "../components/AppNotice";
 import { authenticate } from "../shopify.server";
@@ -16,6 +8,7 @@ import prisma from "../db.server";
 import { FREE_PLAN, STARTER_PLAN } from "@lib/billing/plans";
 import { getPremiumExportCapacity } from "@lib/billing/capacity";
 import { tryGetUsageSummary } from "@lib/billing/usage";
+import { shouldShowHomeUsagePanel } from "@lib/ui/homeUsage";
 import styles from "../styles/studio.module.css";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -46,6 +39,10 @@ export default function Index() {
   const capacity = getPremiumExportCapacity(result.summary);
   const progress = capacity.percentUsed;
   const overQuota = capacity.state === "exhausted";
+  const showUsagePanel = shouldShowHomeUsagePanel({
+    plan,
+    capacityState: capacity.state,
+  });
   const usageHeadline = overQuota
     ? `${quota} image monthly capacity reached`
     : `${used} of ${quota} images processed`;
@@ -56,6 +53,9 @@ export default function Index() {
     state: capacity.state,
     used,
   });
+  const onboardingShellClassName = showUsagePanel
+    ? styles.onboardingShell
+    : `${styles.onboardingShell} ${styles.onboardingShellSingle}`;
 
   return (
     <Page>
@@ -67,6 +67,7 @@ export default function Index() {
             label="Monthly capacity"
             title="Free image capacity used"
             tone="warning"
+            compact
           >
             <p>
               Your Free plan has used its monthly image capacity. Start the
@@ -76,7 +77,7 @@ export default function Index() {
           </AppNotice>
         )}
 
-        <section className={styles.onboardingShell}>
+        <section className={onboardingShellClassName}>
           <div className={styles.onboardingIntro}>
             <div>
               <div className={styles.eyebrow}>Catalog standardization</div>
@@ -102,27 +103,29 @@ export default function Index() {
             </div>
           </div>
 
-          <div className={styles.onboardingUsage}>
-            <div className={styles.onboardingUsageHeader}>
-              <div>
-                <span className={styles.usageShopMeta}>{shop}</span>
-                <strong>{usageHeadline}</strong>
+          {showUsagePanel && (
+            <div className={styles.onboardingUsage}>
+              <div className={styles.onboardingUsageHeader}>
+                <div>
+                  <span className={styles.usageShopMeta}>{shop}</span>
+                  <strong>{usageHeadline}</strong>
+                </div>
+                <Badge tone={plan === STARTER_PLAN ? "success" : "info"}>{plan}</Badge>
               </div>
-              <Badge tone={plan === STARTER_PLAN ? "success" : "info"}>{plan}</Badge>
+              <div
+                className={styles.usageMeter}
+                aria-label={`${progress}% of monthly image capacity used`}
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={progress}
+              >
+                {progress > 0 && <span style={{ width: `${progress}%` }} />}
+              </div>
+              <p>{capacityMessage}</p>
+              <Button url="/app/billing">Plan & usage</Button>
             </div>
-            <div
-              className={styles.usageMeter}
-              aria-label={`${progress}% of monthly image capacity used`}
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={progress}
-            >
-              {progress > 0 && <span style={{ width: `${progress}%` }} />}
-            </div>
-            <p>{capacityMessage}</p>
-            <Button url="/app/billing">Plan & usage</Button>
-          </div>
+          )}
         </section>
 
         {!hasJobs && (
@@ -156,32 +159,21 @@ export default function Index() {
         )}
 
         {hasJobs && (
-          <Card>
-            <BlockStack gap="400">
-              <InlineStack align="space-between" blockAlign="center" gap="300">
-                <BlockStack gap="100">
-                  <Text as="h3" variant="headingMd">
-                    How Unoir keeps your catalog safe
-                  </Text>
-                  <Text as="p" variant="bodyMd" tone="subdued">
-                    Unoir never changes Shopify media until you approve and publish.
-                  </Text>
-                </BlockStack>
-                <Button url="/app/picker" variant="primary">
-                  Start a job
-                </Button>
-              </InlineStack>
-              <div className={styles.onboardingSteps}>
-                {ONBOARDING_STEPS.map((step, index) => (
-                  <div className={styles.onboardingStep} key={step.title}>
-                    <span>{index + 1}</span>
-                    <strong>{step.title}</strong>
-                    <p>{step.copy}</p>
-                  </div>
-                ))}
-              </div>
-            </BlockStack>
-          </Card>
+          <section className={styles.workflowSection}>
+            <div className={styles.workflowHeader}>
+              <h3>How Unoir keeps your catalog safe</h3>
+              <p>Unoir never changes Shopify media until you approve and publish.</p>
+            </div>
+            <div className={styles.onboardingSteps}>
+              {ONBOARDING_STEPS.map((step, index) => (
+                <div className={styles.onboardingStep} key={step.title}>
+                  <span>{index + 1}</span>
+                  <strong>{step.title}</strong>
+                  <p>{step.copy}</p>
+                </div>
+              ))}
+            </div>
+          </section>
         )}
       </BlockStack>
     </Page>
