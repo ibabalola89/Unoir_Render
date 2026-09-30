@@ -35,10 +35,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return redirect(`/app/jobs/${jobId}`);
     }
 
-    // Retry does not create new ProcessedImage rows and intentionally bypasses
-    // the new-job throttle. Failed rows stop counting toward monthly quota;
-    // moving them back to pending reserves quota again (see usage.ts). Retry
-    // itself stays available after the monthly cap so an existing job can finish.
+    // Retry reuses the same ProcessedImage row. That row already counts as one
+    // premium export (usage.ts); failure does not release it, so retry does not
+    // add a second export and stays available after the monthly cap. It bypasses
+    // the new-job throttle.
     // Claim rows one-by-one so a double-submit can't enqueue the same failed
     // image twice. Do not steal a fresh publish/rollback lock — that claim is
     // rolled back with the image updates.

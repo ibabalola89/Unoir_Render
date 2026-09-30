@@ -1,4 +1,5 @@
 import prisma from "../../app/db.server";
+import { REMOVE_BG_REQUEST_TIMEOUT_MS } from "../ai/removeBg";
 import { toBackgroundId, type BackgroundId } from "../backgrounds";
 import { resolveSettledJobStatus } from "../jobs/status";
 import type { BgRemovalJobData } from "./index";
@@ -7,6 +8,39 @@ import { emitTelemetryEvent, serializeError } from "../telemetry";
 export const DEFAULT_STUCK_PROCESSING_MS = 15 * 60 * 1000;
 export const DEFAULT_MAX_RECOVERY_ATTEMPTS = 3;
 export const STUCK_PROCESSING_REASON = "stuck-processing-timeout";
+/** Longer than the remove.bg client abort so an in-flight request can still finish. */
+export const PROVIDER_IN_FLIGHT_MS = REMOVE_BG_REQUEST_TIMEOUT_MS + 30_000;
+
+export type ProviderRecoveryDecision =
+    | "finish-stored-result"
+    | "wait-in-flight"
+    | "fail-provider-unknown"
+    | "call-provider";
+
+/**
+ * Stuck `processing` rows. A stored processed key is finished without another
+ * remove.bg call. A provider timestamp inside the in-flight window means the
+ * call may still be running, so wait. A timestamp outside that window with no
+ * stored bytes means the call may already have happened — do not call again.
+ * No timestamp means remove.bg was not started, so one call is safe.
+ */
+export function decideProviderRecovery(input: {
+    processedKey: string | null;
+    providerStartedAt: Date | null;
+    now: Date;
+    inFlightMs?: number;
+}): ProviderRecoveryDecision {
+    if (input.processedKey) return "finish-stored-result";
+    if (input.providerStartedAt) {
+        const age = input.now.getTime() - input.providerStartedAt.getTime();
+        const inFlightMs = input.inFlightMs ?? PROVIDER_IN_FLIGHT_MS;
+        return age < inFlightMs ? "wait-in-flight" : "fail-provider-unknown";
+    }
+    return "call-provider";
+}
+
+export const PROVIDER_UNKNOWN_FAILURE_MESSAGE =
+    "Processing stopped after the image service was called. Automatic recovery will not call it again. Retry the image if you want another attempt.";
 
 type RecoveryCandidate = {
     id: string;
@@ -14,6 +48,8 @@ type RecoveryCandidate = {
     originalUrl: string;
     shopifyMediaId: string;
     recoveryAttempts: number;
+    processedKey?: string | null;
+    providerStartedAt?: Date | null;
     job: {
         shop: string;
         background: string;
@@ -82,6 +118,8 @@ export async function recoverStuckProcessingImages({
             originalUrl: true,
             shopifyMediaId: true,
             recoveryAttempts: true,
+            processedKey: true,
+            providerStartedAt: true,
             job: { select: { shop: true, background: true } },
         },
     });
@@ -94,6 +132,66 @@ export async function recoverStuckProcessingImages({
     const jobsToReconcile = new Set<string>();
 
     for (const image of candidates) {
+        const decision = decideProviderRecovery({
+            processedKey: image.processedKey ?? null,
+            providerStartedAt: image.providerStartedAt ?? null,
+            now,
+        });
+        if (decision === "finish-stored-result") {
+            const update = await db.processedImage.updateMany({
+                where: { id: image.id, status: "processing", processedKey: { not: null } },
+                data: {
+                    status: "processed",
+                    processingStartedAt: null,
+                    providerStartedAt: null,
+                    errorMessage: null,
+                },
+            });
+            if (update.count > 0) {
+                recovered += 1;
+                recoveredImageIds.push(image.id);
+                jobsToReconcile.add(image.jobId);
+            } else {
+                skipped += 1;
+            }
+            continue;
+        }
+        if (decision === "wait-in-flight") {
+            skipped += 1;
+            continue;
+        }
+        if (decision === "fail-provider-unknown") {
+            const update = await db.processedImage.updateMany({
+                where: {
+                    id: image.id,
+                    status: "processing",
+                    processedKey: null,
+                    providerStartedAt: { not: null },
+                },
+                data: {
+                    status: "failed",
+                    processingStartedAt: null,
+                    providerStartedAt: null,
+                    lastRecoveryAt: now,
+                    recoveryReason: "provider-call-not-replayed",
+                    errorMessage: PROVIDER_UNKNOWN_FAILURE_MESSAGE,
+                },
+            });
+            failed += update.count;
+            if (update.count > 0) {
+                emitTelemetryEvent("recovery_skipped_provider_replay", {
+                    jobId: image.jobId,
+                    imageId: image.id,
+                    shop: image.job.shop,
+                }, "warn");
+                failedImageIds.push(image.id);
+                jobsToReconcile.add(image.jobId);
+            } else {
+                skipped += 1;
+            }
+            continue;
+        }
+
         if (image.recoveryAttempts >= maxRecoveryAttempts) {
             const update = await db.processedImage.updateMany({
                 where: { id: image.id, status: "processing", ...staleProcessingWhere },
@@ -150,6 +248,8 @@ export async function recoverStuckProcessingImages({
             where: {
                 id: image.id,
                 status: "processing",
+                processedKey: null,
+                providerStartedAt: null,
                 ...staleProcessingWhere,
                 job: { status: { not: "canceled" } },
             },

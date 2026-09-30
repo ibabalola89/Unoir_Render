@@ -8,9 +8,9 @@
  *   4. Persist S3 keys (NOT URLs — URLs are resolved at read time).
  *   5. When all images in a job settle, mark the job done.
  *
- * Retry policy: BullMQ owns retries. We mark the row `processing` while
- * a job is running and only flip it to `processed` / `failed` from the
- * worker's terminal events (`completed` / `failed`).
+ * Retry policy: BullMQ retries a remove.bg HTTP error. A timeout, abort, or
+ * crash does not prove the call never started, so that attempt is not sent
+ * again. A stored processed key is finished without another call.
  */
 
 import "dotenv/config";
@@ -19,7 +19,12 @@ import prisma from "../../app/db.server";
 import { getBackgroundOutputExtension, UnknownBackgroundError } from "../backgrounds";
 import { QUEUE_NAMES, getRedisConnection, validateRedisUrl } from "./connection";
 import { enqueueBgRemoval, type BgRemovalJobData } from "./index";
-import { recoverStuckProcessingImages } from "./recovery";
+import {
+    decideProviderRecovery,
+    PROVIDER_IN_FLIGHT_MS,
+    PROVIDER_UNKNOWN_FAILURE_MESSAGE,
+    recoverStuckProcessingImages,
+} from "./recovery";
 import { checkRemoveBgAccount, removeBackground, RemoveBgError } from "../ai/removeBg";
 import { resolveSettledJobStatus } from "../jobs/status";
 import {
@@ -42,6 +47,88 @@ async function isImageCanceled(imageId: string): Promise<boolean> {
     return !image || image.status === "canceled" || image.job.status === "canceled";
 }
 
+type InFlightImage = {
+    status: string;
+    processedKey: string | null;
+    providerStartedAt: Date | null;
+    job: { status: string };
+};
+
+async function readInFlightImage(imageId: string): Promise<InFlightImage | null> {
+    return prisma.processedImage.findUnique({
+        where: { id: imageId },
+        select: {
+            status: true,
+            processedKey: true,
+            providerStartedAt: true,
+            job: { select: { status: true } },
+        },
+    });
+}
+
+function providerDecision(image: InFlightImage) {
+    return decideProviderRecovery({
+        processedKey: image.processedKey,
+        providerStartedAt: image.providerStartedAt,
+        now: new Date(),
+        inFlightMs: PROVIDER_IN_FLIGHT_MS,
+    });
+}
+
+/**
+ * Apply a non-call decision. Returns true when this attempt must not call remove.bg.
+ * An in-flight timestamp is waited out here so a stalled redelivery cannot call again.
+ */
+async function settleWithoutProviderCall(imageId: string): Promise<boolean> {
+    let image = await readInFlightImage(imageId);
+    if (!image || image.status === "canceled" || image.job.status === "canceled") return true;
+    if (image.status !== "processing" && image.status !== "pending") return true;
+
+    let decision = providerDecision(image);
+    if (decision === "call-provider") return false;
+
+    if (decision === "wait-in-flight" && image.providerStartedAt) {
+        const remaining = image.providerStartedAt.getTime() + PROVIDER_IN_FLIGHT_MS - Date.now();
+        if (remaining > 0) {
+            await new Promise((resolve) => setTimeout(resolve, remaining));
+        }
+        image = await readInFlightImage(imageId);
+        if (!image || image.status === "canceled" || image.job.status === "canceled") return true;
+        if (image.status !== "processing" && image.status !== "pending") return true;
+        decision = providerDecision(image);
+        if (decision === "call-provider") return false;
+        if (decision === "wait-in-flight") return true;
+    }
+
+    if (decision === "finish-stored-result") {
+        await prisma.processedImage.updateMany({
+            where: { id: imageId, status: "processing", processedKey: { not: null } },
+            data: {
+                status: "processed",
+                processingStartedAt: null,
+                providerStartedAt: null,
+                errorMessage: null,
+            },
+        });
+    } else if (decision === "fail-provider-unknown") {
+        await prisma.processedImage.updateMany({
+            where: {
+                id: imageId,
+                status: "processing",
+                processedKey: null,
+                providerStartedAt: { not: null },
+            },
+            data: {
+                status: "failed",
+                processingStartedAt: null,
+                providerStartedAt: null,
+                errorMessage: PROVIDER_UNKNOWN_FAILURE_MESSAGE,
+            },
+        });
+    }
+    return true;
+}
+
 async function processImage(job: Job<BgRemovalJobData>): Promise<void> {
     const { jobId, imageId, background, sourceUrl } = job.data;
 
@@ -52,49 +139,137 @@ async function processImage(job: Job<BgRemovalJobData>): Promise<void> {
         data: { status: "processing" },
     });
 
-    const claim = await prisma.processedImage.updateMany({
-        where: {
-            id: imageId,
-            status: "pending",
-            job: { status: { not: "canceled" } },
-        },
-        data: { status: "processing", processingStartedAt: new Date(), errorMessage: null },
-    });
-    if (claim.count === 0) return;
+    const existing = await readInFlightImage(imageId);
+    if (!existing || existing.status === "canceled" || existing.job.status === "canceled") return;
 
-    // 1. Backup original (idempotent overwrite).
+    if (existing.status === "pending") {
+        const claim = await prisma.processedImage.updateMany({
+            where: {
+                id: imageId,
+                status: "pending",
+                job: { status: { not: "canceled" } },
+            },
+            data: { status: "processing", processingStartedAt: new Date(), errorMessage: null },
+        });
+        if (claim.count === 0) return;
+    } else if (existing.status !== "processing") {
+        return;
+    }
+
+    if (await settleWithoutProviderCall(imageId)) return;
+
+    // 1. Backup original before any provider call (idempotent overwrite).
     const original = await uploadFromUrl({
         key: buildOriginalKey(jobId, imageId),
         sourceUrl,
     });
     if (await isImageCanceled(imageId)) return;
+    if (await settleWithoutProviderCall(imageId)) return;
 
-    // 2. remove.bg
-    const result = await removeBackground({ imageUrl: sourceUrl, background });
-    if (await isImageCanceled(imageId)) return;
-
-    // 3. Upload processed bytes.
-    const ext = getBackgroundOutputExtension(background);
-    const processed = await uploadBuffer({
-        key: buildProcessedKey(jobId, imageId, ext),
-        body: result.imageBuffer,
-        contentType: result.contentType,
-    });
-
-    // 4. Persist keys.
-    await prisma.processedImage.updateMany({
+    // 2. Claim the provider call. A second worker cannot pass this once the timestamp is set.
+    const providerClaim = await prisma.processedImage.updateMany({
         where: {
             id: imageId,
             status: "processing",
+            providerStartedAt: null,
+            processedKey: null,
             job: { status: { not: "canceled" } },
         },
-        data: {
-            status: "processed",
-            processingStartedAt: null,
-            originalBackupKey: original.key,
-            processedKey: processed.key,
-        },
+        data: { providerStartedAt: new Date() },
     });
+    if (providerClaim.count === 0) {
+        await settleWithoutProviderCall(imageId);
+        return;
+    }
+
+    let providerFinished = false;
+    try {
+        const result = await removeBackground({ imageUrl: sourceUrl, background });
+        providerFinished = true;
+        if (await isImageCanceled(imageId)) return;
+
+        // 3. Store bytes before the status flip so a crash can finish from the key.
+        const ext = getBackgroundOutputExtension(background);
+        const processed = await uploadBuffer({
+            key: buildProcessedKey(jobId, imageId, ext),
+            body: result.imageBuffer,
+            contentType: result.contentType,
+        });
+        await prisma.processedImage.updateMany({
+            where: { id: imageId, status: "processing" },
+            data: {
+                originalBackupKey: original.key,
+                processedKey: processed.key,
+            },
+        });
+        await prisma.processedImage.updateMany({
+            where: {
+                id: imageId,
+                status: "processing",
+                processedKey: { not: null },
+                job: { status: { not: "canceled" } },
+            },
+            data: {
+                status: "processed",
+                processingStartedAt: null,
+                providerStartedAt: null,
+            },
+        });
+    } catch (err) {
+        if (!providerFinished) {
+            if (err instanceof UnknownBackgroundError) {
+                await prisma.processedImage.updateMany({
+                    where: { id: imageId, status: "processing", processedKey: null },
+                    data: {
+                        status: "failed",
+                        processingStartedAt: null,
+                        providerStartedAt: null,
+                        errorMessage: err.message,
+                    },
+                });
+                await maybeFinalizeJob(jobId);
+                throw new UnrecoverableError(err.message);
+            }
+            if (err instanceof RemoveBgError) {
+                // An HTTP response proves this call finished without a body.
+                await prisma.processedImage.updateMany({
+                    where: { id: imageId, status: "processing", processedKey: null },
+                    data: { providerStartedAt: null },
+                });
+                throw err;
+            }
+            // Timeout, abort, or network drop: the request may still be running.
+            await settleWithoutProviderCall(imageId);
+            return;
+        }
+        const stored = await prisma.processedImage.findUnique({
+            where: { id: imageId },
+            select: { processedKey: true },
+        });
+        if (stored?.processedKey) {
+            await prisma.processedImage.updateMany({
+                where: { id: imageId, status: "processing", processedKey: { not: null } },
+                data: {
+                    status: "processed",
+                    processingStartedAt: null,
+                    providerStartedAt: null,
+                    errorMessage: null,
+                },
+            });
+            return;
+        }
+        await prisma.processedImage.updateMany({
+            where: { id: imageId, status: "processing", processedKey: null },
+            data: {
+                status: "failed",
+                processingStartedAt: null,
+                providerStartedAt: null,
+                errorMessage: PROVIDER_UNKNOWN_FAILURE_MESSAGE,
+            },
+        });
+        await maybeFinalizeJob(jobId);
+        throw new UnrecoverableError(PROVIDER_UNKNOWN_FAILURE_MESSAGE);
+    }
 }
 
 async function maybeFinalizeJob(jobId: string): Promise<void> {
@@ -170,10 +345,30 @@ export function startWorker(): Worker<BgRemovalJobData> {
             (job.opts.attempts ?? 1) - (job.attemptsMade ?? 0);
         const shouldFinalize = isFatal || attemptsLeft <= 0;
         try {
+            const stored = await prisma.processedImage.updateMany({
+                where: {
+                    id: job.data.imageId,
+                    status: "processing",
+                    processedKey: { not: null },
+                    job: { status: { not: "canceled" } },
+                },
+                data: {
+                    status: "processed",
+                    processingStartedAt: null,
+                    providerStartedAt: null,
+                    errorMessage: null,
+                },
+            });
+            if (stored.count > 0) {
+                await maybeFinalizeJob(job.data.jobId);
+                return;
+            }
             const update = await prisma.processedImage.updateMany({
                 where: {
                     id: job.data.imageId,
-                    status: { not: "canceled" },
+                    status: { in: ["pending", "processing"] },
+                    processedKey: null,
+                    providerStartedAt: null,
                     job: { status: { not: "canceled" } },
                 },
                 data: {
@@ -286,7 +481,12 @@ async function shutdown(worker: Worker<BgRemovalJobData>): Promise<void> {
     if (owned.length > 0) {
         try {
             const reset = await prisma.processedImage.updateMany({
-                where: { id: { in: owned }, status: "processing" },
+                where: {
+                    id: { in: owned },
+                    status: "processing",
+                    providerStartedAt: null,
+                    processedKey: null,
+                },
                 data: { status: "pending", processingStartedAt: null },
             });
             if (reset.count > 0) {

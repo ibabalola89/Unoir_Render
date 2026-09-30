@@ -56,6 +56,7 @@ model ProcessedImage {
   status              String        @default("pending")
   errorMessage        String?
   processingStartedAt DateTime?
+  providerStartedAt   DateTime?
   recoveryAttempts    Int           @default(0)
   lastRecoveryAt      DateTime?
   recoveryReason      String?

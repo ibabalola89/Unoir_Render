@@ -469,6 +469,21 @@ function getJobState(input: {
         };
     }
 
+    if (input.jobStatus === "partially_published") {
+        return {
+            kind: "completed",
+            label: "partially published",
+            title,
+            subtitle: input.failedCount > 0
+                ? "Some images are on Shopify. Others still need attention before the set is fully published. Originals stay in place."
+                : "Some images are on Shopify. The rest still need review before the set is fully published.",
+            showProgress: false,
+            showMetrics: true,
+            canCancel: false,
+            shouldPoll: false,
+        };
+    }
+
     if (input.jobStatus === "failed" && input.readyCount === 0) {
         return {
             kind: "failed",

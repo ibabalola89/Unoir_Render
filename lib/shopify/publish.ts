@@ -252,6 +252,100 @@ interface ReorderMediaResponse {
     errors?: Array<{ message: string }>;
 }
 
+export type AppAddedMediaMatch =
+    | { kind: "found"; mediaId: string }
+    | { kind: "none" }
+    | { kind: "ambiguous" };
+
+/** Match Shopify media we already created for this processed object key. */
+export function matchMediaByProcessedKey(
+    items: Array<{ id?: string | null; sourceUrl?: string | null }>,
+    processedKey: string,
+): AppAddedMediaMatch {
+    const matches = items.filter(
+        (item): item is { id: string; sourceUrl?: string | null } =>
+            Boolean(item.id && item.sourceUrl?.includes(processedKey)),
+    );
+    if (matches.length === 1) return { kind: "found", mediaId: matches[0].id };
+    if (matches.length > 1) return { kind: "ambiguous" };
+    return { kind: "none" };
+}
+
+const PRODUCT_MEDIA_SOURCES = `#graphql
+  query UnoirProductMediaSources($id: ID!, $after: String) {
+    product(id: $id) {
+      media(first: 50, after: $after, query: "media_type:IMAGE") {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            ... on MediaImage {
+              id
+              originalSource { url }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+interface ProductMediaSourcesResponse {
+    data?: {
+        product?: {
+            media?: {
+                pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+                edges: Array<{ node: { id?: string; originalSource?: { url?: string | null } | null } }>;
+            };
+        } | null;
+    };
+    errors?: Array<{ message: string }>;
+}
+
+const MAX_PRODUCT_MEDIA_PAGES = 10;
+
+export type ExistingAppMediaLookup =
+    | AppAddedMediaMatch
+    | { kind: "incomplete" };
+
+/**
+ * Look for a Shopify image whose original source still contains our processed
+ * object key. Stops instead of guessing when the gallery is larger than the
+ * pages we read or more than one image matches.
+ */
+export async function findExistingAppMedia(
+    admin: AdminApiContext,
+    input: { productId: string; processedKey: string },
+): Promise<ExistingAppMediaLookup> {
+    const collected: Array<{ id?: string | null; sourceUrl?: string | null }> = [];
+    let after: string | null = null;
+    for (let page = 0; page < MAX_PRODUCT_MEDIA_PAGES; page++) {
+        const cursor = after;
+        const json = await shopifyGraphqlWithRetry<ProductMediaSourcesResponse>(admin, async (a) => {
+            const response = await a.graphql(PRODUCT_MEDIA_SOURCES, {
+                variables: { id: input.productId, after: cursor },
+            });
+            return (await response.json()) as ProductMediaSourcesResponse;
+        });
+        if (json.errors?.length) {
+            throw new Error(
+                `Shopify product media lookup failed: ${json.errors.map((e) => e.message).join(", ")}`,
+            );
+        }
+        const media = json.data?.product?.media;
+        for (const edge of media?.edges ?? []) {
+            collected.push({
+                id: edge.node.id,
+                sourceUrl: edge.node.originalSource?.url,
+            });
+        }
+        const matched = matchMediaByProcessedKey(collected, input.processedKey);
+        if (matched.kind !== "none") return matched;
+        if (!media?.pageInfo?.hasNextPage || !media.pageInfo.endCursor) return { kind: "none" };
+        after = media.pageInfo.endCursor;
+    }
+    return { kind: "incomplete" };
+}
+
 export async function promoteMediaToPrimary(
     admin: AdminApiContext,
     input: { productId: string; mediaId: string },

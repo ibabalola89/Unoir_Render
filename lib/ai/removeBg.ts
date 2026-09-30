@@ -13,6 +13,8 @@ import {
 } from "../backgrounds";
 
 const REMOVE_BG_ENDPOINT = "https://api.remove.bg/v1.0/removebg";
+/** Client abort for one remove.bg request. Recovery waits past this before treating a call as finished. */
+export const REMOVE_BG_REQUEST_TIMEOUT_MS = 60_000;
 const REMOVE_BG_ACCOUNT_ENDPOINT = "https://api.remove.bg/v1.0/account";
 
 export type RemoveBgBackground = BackgroundId;
@@ -100,7 +102,7 @@ export async function removeBackground(input: RemoveBgInput): Promise<RemoveBgRe
             "X-Api-Key": getApiKey(),
         },
         body: form,
-        signal: AbortSignal.timeout(60_000),
+        signal: AbortSignal.timeout(REMOVE_BG_REQUEST_TIMEOUT_MS),
     });
 
     if (!response.ok) {

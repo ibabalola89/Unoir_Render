@@ -44,5 +44,5 @@ Run these on production infrastructure before private beta as part of [PRODUCTIO
 
 ## Remaining Hard-To-Prove Cases
 
-- If Shopify `productCreateMedia` succeeds but the DB update fails before `publishedMediaId` is saved, a later publish retry cannot know which Shopify media was created. Production smoke testing should watch for this rare duplicate-media case.
+- Publish writes `publishedMediaId` before the status update, and a retry reuses a Shopify image whose `originalSource.url` still contains the processed object key. If Shopify has replaced that source URL and the media id was never stored, nothing we kept identifies the gallery image. That retry can still create a second file; we do not guess a match.
 - Public CDN readiness now depends on DNS being live; `/health?cdn=1` and `/app/ops?cdn=1` verify object serving through the configured `STORAGE_PUBLIC_BASE_URL` once the domain resolves.
