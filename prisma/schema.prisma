@@ -71,6 +71,8 @@ model ProcessedImage {
   recoveryReason   String?
   publishedMediaId String?      // Shopify media GID after publish
   publishMode      String?      // append|replace_primary, captured when published
+  publishStamp     String?      // Token sent as Shopify alt text before productCreateMedia
+  publishCreateStartedAt DateTime? // Set immediately before productCreateMedia; blocks a second create
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 

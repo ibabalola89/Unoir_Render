@@ -62,6 +62,8 @@ model ProcessedImage {
   recoveryReason      String?
   publishedMediaId    String?
   publishMode         String?
+  publishStamp        String?
+  publishCreateStartedAt DateTime?
   createdAt           DateTime      @default(now())
   updatedAt           DateTime      @updatedAt
 

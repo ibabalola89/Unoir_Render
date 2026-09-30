@@ -23,6 +23,7 @@ import {
     resolveActivePlan,
 } from "@lib/billing/usage";
 import { checkStorageBucket } from "@lib/storage";
+import { publishStampForImage } from "@lib/shopify/publish";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
 
 /**
@@ -276,7 +277,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             if (recentJobs >= PROCESS_JOBS_PER_HOUR) {
                 throw new RateLimitRaceError(new Date(rateWindowStart.getTime() + 60 * 60 * 1000));
             }
-            return tx.processingJob.create({
+            const created = await tx.processingJob.create({
                 data: {
                     shop: session.shop,
                     status: "queued",
@@ -295,6 +296,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                 },
                 include: { images: true },
             });
+            for (const image of created.images) {
+                await tx.processedImage.update({
+                    where: { id: image.id },
+                    data: { publishStamp: publishStampForImage(image.id) },
+                });
+            }
+            return created;
         }, isSqlite() ? undefined : { isolationLevel: "Serializable" });
     } catch (err) {
         if (err instanceof QuotaRaceError) {

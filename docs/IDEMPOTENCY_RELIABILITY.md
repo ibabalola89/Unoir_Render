@@ -44,5 +44,5 @@ Run these on production infrastructure before private beta as part of [PRODUCTIO
 
 ## Remaining Hard-To-Prove Cases
 
-- Publish writes `publishedMediaId` before the status update, and a retry reuses a Shopify image whose `originalSource.url` still contains the processed object key. If Shopify has replaced that source URL and the media id was never stored, nothing we kept identifies the gallery image. That retry can still create a second file; we do not guess a match.
+- Publish writes `publishedMediaId` before the status update. New images carry a `publishStamp` that is appended to the Shopify alt before `productCreateMedia`. A retry reuses a gallery image with that stamp or a source URL that still contains the processed object key. A historical row with no stamp and no saved media id is not sent to `productCreateMedia` again. A create that already started is not sent again until that stamp is found.
 - Public CDN readiness now depends on DNS being live; `/health?cdn=1` and `/app/ops?cdn=1` verify object serving through the configured `STORAGE_PUBLIC_BASE_URL` once the domain resolves.

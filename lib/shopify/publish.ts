@@ -17,7 +17,58 @@
  */
 
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
-import { shopifyGraphqlWithRetry } from "./retry";
+import { ShopifyGraphqlThrottledError, shopifyGraphqlWithRetry } from "./retry";
+
+/** Shopify keeps MediaImage.alt after it replaces originalSource with its CDN URL. */
+export const SHOPIFY_IMAGE_ALT_MAX = 512;
+export const PUBLISH_STAMP_PREFIX = "unoir-publish:";
+
+export function publishStampForImage(imageId: string): string {
+    return `${PUBLISH_STAMP_PREFIX}${imageId}`;
+}
+
+export function altHasPublishStamp(alt: string | null | undefined, stamp: string): boolean {
+    if (!alt || !stamp) return false;
+    return alt.split(/\s+/).includes(stamp);
+}
+
+/**
+ * Keep the merchant alt and append the stamp as its own token.
+ * A very long alt is shortened so the stamp still fits Shopify's limit.
+ */
+export function altTextWithPublishStamp(
+    merchantAlt: string | null | undefined,
+    stamp: string,
+): string {
+    const preserved = (merchantAlt ?? "")
+        .split(/\s+/)
+        .filter((token) => token && token !== stamp)
+        .join(" ");
+    if (!preserved) return stamp.slice(0, SHOPIFY_IMAGE_ALT_MAX);
+    const combined = `${preserved} ${stamp}`;
+    if (combined.length <= SHOPIFY_IMAGE_ALT_MAX) return combined;
+    const room = SHOPIFY_IMAGE_ALT_MAX - stamp.length - 1;
+    if (room <= 0) return stamp.slice(0, SHOPIFY_IMAGE_ALT_MAX);
+    return `${preserved.slice(0, room).trimEnd()} ${stamp}`;
+}
+
+/** Shopify answered and did not create media. A later publish may try once more. */
+export class ShopifyPublishRejectedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ShopifyPublishRejectedError";
+    }
+}
+
+/**
+ * True when a create call may already have added a file.
+ * A rejection or throttle means Shopify did not accept the mutation.
+ */
+export function publishAttemptMayHaveCreated(err: unknown): boolean {
+    if (err instanceof ShopifyPublishRejectedError) return false;
+    if (err instanceof ShopifyGraphqlThrottledError) return false;
+    return true;
+}
 
 const PRODUCT_CREATE_MEDIA = `#graphql
   mutation UnoirCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
@@ -79,16 +130,16 @@ export async function publishProcessedMedia(
     });
 
     if (json.errors?.length) {
-        throw new Error(
+        throw new ShopifyPublishRejectedError(
             `Shopify productCreateMedia failed: ${json.errors.map((e) => e.message).join(", ")}`,
         );
     }
     const result = json.data?.productCreateMedia;
     if (!result) {
-        throw new Error("Shopify productCreateMedia returned no data");
+        throw new ShopifyPublishRejectedError("Shopify productCreateMedia returned no data");
     }
     if (result.mediaUserErrors.length > 0) {
-        throw new Error(
+        throw new ShopifyPublishRejectedError(
             `Shopify mediaUserErrors: ${result.mediaUserErrors
                 .map((e) => `${e.code ?? ""} ${e.message}`)
                 .join("; ")}`,
@@ -96,7 +147,7 @@ export async function publishProcessedMedia(
     }
     const created = result.media[0];
     if (!created?.id) {
-        throw new Error("Shopify productCreateMedia returned no media node");
+        throw new ShopifyPublishRejectedError("Shopify productCreateMedia returned no media node");
     }
     return { mediaId: created.id, status: created.status ?? null };
 }
@@ -257,18 +308,41 @@ export type AppAddedMediaMatch =
     | { kind: "none" }
     | { kind: "ambiguous" };
 
-/** Match Shopify media we already created for this processed object key. */
-export function matchMediaByProcessedKey(
-    items: Array<{ id?: string | null; sourceUrl?: string | null }>,
-    processedKey: string,
+type GalleryMedia = {
+    id?: string | null;
+    sourceUrl?: string | null;
+    alt?: string | null;
+};
+
+/**
+ * Match a file this app added. A processed-key source URL still counts.
+ * After Shopify replaces that URL, the publish stamp in alt text is the match.
+ * Alt text, gallery position, and the original product media id are not used
+ * except for that exact stamp token.
+ */
+export function matchAppAddedMedia(
+    items: GalleryMedia[],
+    input: { processedKey?: string | null; publishStamp?: string | null },
 ): AppAddedMediaMatch {
-    const matches = items.filter(
-        (item): item is { id: string; sourceUrl?: string | null } =>
-            Boolean(item.id && item.sourceUrl?.includes(processedKey)),
-    );
+    const processedKey = input.processedKey || null;
+    const publishStamp = input.publishStamp || null;
+    const matches = items.filter((item): item is GalleryMedia & { id: string } => {
+        if (!item.id) return false;
+        const byKey = Boolean(processedKey && item.sourceUrl?.includes(processedKey));
+        const byStamp = Boolean(publishStamp && altHasPublishStamp(item.alt, publishStamp));
+        return byKey || byStamp;
+    });
     if (matches.length === 1) return { kind: "found", mediaId: matches[0].id };
     if (matches.length > 1) return { kind: "ambiguous" };
     return { kind: "none" };
+}
+
+/** Match Shopify media we already created for this processed object key. */
+export function matchMediaByProcessedKey(
+    items: GalleryMedia[],
+    processedKey: string,
+): AppAddedMediaMatch {
+    return matchAppAddedMedia(items, { processedKey });
 }
 
 const PRODUCT_MEDIA_SOURCES = `#graphql
@@ -280,6 +354,7 @@ const PRODUCT_MEDIA_SOURCES = `#graphql
           node {
             ... on MediaImage {
               id
+              alt
               originalSource { url }
             }
           }
@@ -294,7 +369,7 @@ interface ProductMediaSourcesResponse {
         product?: {
             media?: {
                 pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
-                edges: Array<{ node: { id?: string; originalSource?: { url?: string | null } | null } }>;
+                edges: Array<{ node: { id?: string; alt?: string | null; originalSource?: { url?: string | null } | null } }>;
             };
         } | null;
     };
@@ -308,23 +383,23 @@ export type ExistingAppMediaLookup =
     | { kind: "incomplete" };
 
 /**
- * Look for a Shopify image whose original source still contains our processed
- * object key. Stops instead of guessing when the gallery is larger than the
- * pages we read or more than one image matches.
+ * Look for a Shopify image this app already added. A single match is returned
+ * only after the gallery is fully read. More than one match, or a gallery
+ * larger than the pages we read, does not pick a file.
  */
 export async function findExistingAppMedia(
     admin: AdminApiContext,
-    input: { productId: string; processedKey: string },
+    input: { productId: string; processedKey?: string | null; publishStamp?: string | null },
 ): Promise<ExistingAppMediaLookup> {
-    const collected: Array<{ id?: string | null; sourceUrl?: string | null }> = [];
+    const collected: GalleryMedia[] = [];
     let after: string | null = null;
     for (let page = 0; page < MAX_PRODUCT_MEDIA_PAGES; page++) {
-        const cursor = after;
-        const json = await shopifyGraphqlWithRetry<ProductMediaSourcesResponse>(admin, async (a) => {
-            const response = await a.graphql(PRODUCT_MEDIA_SOURCES, {
+        const cursor: string | null = after;
+        const json: ProductMediaSourcesResponse = await shopifyGraphqlWithRetry<ProductMediaSourcesResponse>(admin, async (a) => {
+            const response: { json(): Promise<ProductMediaSourcesResponse> } = await a.graphql(PRODUCT_MEDIA_SOURCES, {
                 variables: { id: input.productId, after: cursor },
             });
-            return (await response.json()) as ProductMediaSourcesResponse;
+            return response.json();
         });
         if (json.errors?.length) {
             throw new Error(
@@ -335,12 +410,13 @@ export async function findExistingAppMedia(
         for (const edge of media?.edges ?? []) {
             collected.push({
                 id: edge.node.id,
+                alt: edge.node.alt,
                 sourceUrl: edge.node.originalSource?.url,
             });
         }
-        const matched = matchMediaByProcessedKey(collected, input.processedKey);
-        if (matched.kind !== "none") return matched;
-        if (!media?.pageInfo?.hasNextPage || !media.pageInfo.endCursor) return { kind: "none" };
+        const matched = matchAppAddedMedia(collected, input);
+        if (matched.kind === "ambiguous") return matched;
+        if (!media?.pageInfo?.hasNextPage || !media.pageInfo.endCursor) return matched;
         after = media.pageInfo.endCursor;
     }
     return { kind: "incomplete" };

@@ -4,14 +4,22 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getPublishUrl } from "@lib/storage";
 import {
+    altTextWithPublishStamp,
     deletePublishedMedia,
     findExistingAppMedia,
     promoteMediaToPrimary,
+    publishAttemptMayHaveCreated,
     publishProcessedMedia,
     verifyMediaStatus,
 } from "@lib/shopify/publish";
 import { countStatuses, resolveSettledJobStatus, workflowLockClaimWhere } from "@lib/jobs/status";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
+import {
+    PUBLISH_AMBIGUOUS_MATCH_MESSAGE,
+    PUBLISH_INCOMPLETE_GALLERY_MESSAGE,
+    PUBLISH_OUTCOME_UNKNOWN_MESSAGE,
+    PUBLISH_RECONCILE_REQUIRED_MESSAGE,
+} from "@lib/ui/failureCopy";
 
 /**
  * Publish action.
@@ -31,8 +39,9 @@ import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
  *   any publishing / failed_publish / mixed published rows → partially_published
  *   only approved create failures remaining → completed
  *
- * Re-clicking Publish is idempotent — `approved` rows retry create, `publishing`
- * rows are re-verified (no duplicate productCreateMedia call).
+ * Re-clicking Publish is idempotent — a stored media id or a publish stamp
+ * already on the product is reused. `publishing` rows are re-verified.
+ * A create is not repeated when its result is unknown.
  */
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     await authenticate.admin(request);
@@ -126,8 +135,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
                             continue;
                         }
                         try {
+                            let mediaId = image.publishedMediaId;
+                            let createStartedAt = image.publishCreateStartedAt;
                             // Id was stored before a later write failed. Do not create again.
-                            if (image.publishedMediaId && image.status !== "failed_publish") {
+                            if (mediaId && image.status !== "failed_publish") {
                                 await prisma.processedImage.update({
                                     where: { id: image.id },
                                     data: {
@@ -138,11 +149,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
                                 });
                                 continue;
                             }
-                            if (image.status === "failed_publish" && image.publishedMediaId) {
+                            if (image.status === "failed_publish" && mediaId) {
                                 try {
                                     await deletePublishedMedia(admin, {
                                         productId: image.shopifyProductId,
-                                        mediaId: image.publishedMediaId,
+                                        mediaId,
                                     });
                                 } catch (err) {
                                     const message = err instanceof Error ? err.message : String(err);
@@ -154,33 +165,73 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
                                 }
                                 await prisma.processedImage.update({
                                     where: { id: image.id },
-                                    data: { publishedMediaId: null },
+                                    data: { publishedMediaId: null, publishCreateStartedAt: null },
                                 });
+                                mediaId = null;
+                                createStartedAt = null;
                             }
                             const existing = await findExistingAppMedia(admin, {
                                 productId: image.shopifyProductId,
                                 processedKey: image.processedKey,
+                                publishStamp: image.publishStamp,
                             });
                             if (existing.kind === "ambiguous" || existing.kind === "incomplete") {
                                 await prisma.processedImage.update({
                                     where: { id: image.id },
                                     data: {
                                         errorMessage: existing.kind === "ambiguous"
-                                            ? "More than one Shopify image matches this result. Nothing new was published."
-                                            : "Shopify's product gallery could not be fully checked, so nothing new was published.",
+                                            ? PUBLISH_AMBIGUOUS_MATCH_MESSAGE
+                                            : PUBLISH_INCOMPLETE_GALLERY_MESSAGE,
                                     },
                                 });
                                 continue;
                             }
-                            let mediaId = existing.kind === "found" ? existing.mediaId : null;
-                            if (!mediaId) {
-                                const sourceUrl = await getPublishUrl(image.processedKey);
-                                const result = await publishProcessedMedia(admin, {
-                                    productId: image.shopifyProductId,
-                                    sourceUrl,
-                                    altText: image.shopifyAltText,
+                            if (existing.kind === "found") mediaId = existing.mediaId;
+                            if (!mediaId && !image.publishStamp) {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { errorMessage: PUBLISH_RECONCILE_REQUIRED_MESSAGE },
                                 });
-                                mediaId = result.mediaId;
+                                continue;
+                            }
+                            if (!mediaId && createStartedAt) {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { errorMessage: PUBLISH_OUTCOME_UNKNOWN_MESSAGE },
+                                });
+                                continue;
+                            }
+                            if (!mediaId) {
+                                if (!image.publishStamp) continue;
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { publishCreateStartedAt: new Date() },
+                                });
+                                const sourceUrl = await getPublishUrl(image.processedKey);
+                                try {
+                                    const result = await publishProcessedMedia(admin, {
+                                        productId: image.shopifyProductId,
+                                        sourceUrl,
+                                        altText: altTextWithPublishStamp(image.shopifyAltText, image.publishStamp),
+                                    });
+                                    mediaId = result.mediaId;
+                                } catch (err) {
+                                    if (publishAttemptMayHaveCreated(err)) {
+                                        await prisma.processedImage.update({
+                                            where: { id: image.id },
+                                            data: { errorMessage: PUBLISH_OUTCOME_UNKNOWN_MESSAGE },
+                                        });
+                                        continue;
+                                    }
+                                    await prisma.processedImage.update({
+                                        where: { id: image.id },
+                                        data: {
+                                            publishCreateStartedAt: null,
+                                            errorMessage: err instanceof Error ? err.message : String(err),
+                                        },
+                                    });
+                                    continue;
+                                }
                             }
                             // Persist the Shopify id before status or primary promotion.
                             await prisma.processedImage.update({

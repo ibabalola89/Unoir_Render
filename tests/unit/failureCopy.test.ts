@@ -5,6 +5,7 @@ import {
     getPreviewErrorMessage,
     getRollbackResultNotice,
     getSafeImageMessage,
+    PUBLISH_RECONCILE_REQUIRED_MESSAGE,
 } from "../../lib/ui/failureCopy";
 
 describe("failure copy", () => {
@@ -60,5 +61,9 @@ describe("failure copy", () => {
         expect(getSafeImageMessage("failed_publish")).toContain("Retry publish when ready");
         expect(getSafeImageMessage("published")).toContain("follow-up update did not complete");
         expect(getSafeImageMessage("failed")).toContain("Nothing was published");
+        expect(getSafeImageMessage("approved", PUBLISH_RECONCILE_REQUIRED_MESSAGE))
+            .toBe(PUBLISH_RECONCILE_REQUIRED_MESSAGE);
+        expect(getSafeImageMessage("approved", "Shopify productCreateMedia failed: internal"))
+            .toContain("Nothing was published");
     });
 });

@@ -337,7 +337,7 @@ function ImageReviewCard({
 
             {image.errorMessage && (
                 <AppNotice compact tone="warning" title="Image needs attention">
-                    <p>{getSafeImageMessage(image.status)}</p>
+                    <p>{getSafeImageMessage(image.status, image.errorMessage)}</p>
                 </AppNotice>
             )}
         </article>
