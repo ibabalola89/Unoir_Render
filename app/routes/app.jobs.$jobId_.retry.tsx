@@ -3,6 +3,7 @@ import { redirect } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { toBackgroundId } from "@lib/backgrounds";
+import { countStatuses, resolveSettledJobStatus, WorkflowLockError, workflowLockClaimWhere } from "@lib/jobs/status";
 import { enqueueBgRemoval } from "@lib/queue";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
@@ -34,28 +35,38 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return redirect(`/app/jobs/${jobId}`);
     }
 
-    // Retry does not create new ProcessedImage rows, so it does not consume
-    // additional monthly quota and intentionally bypasses the new-job throttle.
+    // Retry reuses the same ProcessedImage row. That row already counts as one
+    // premium export (usage.ts); failure does not release it, so retry does not
+    // add a second export and stays available after the monthly cap. It bypasses
+    // the new-job throttle.
     // Claim rows one-by-one so a double-submit can't enqueue the same failed
-    // image twice and then mark a successfully claimed row failed because
-    // BullMQ rejected the duplicate job id.
-    const claimedImageIds = await prisma.$transaction(async (tx) => {
-        const claimed: string[] = [];
-        for (const image of job.images) {
-            const result = await tx.processedImage.updateMany({
-                where: { id: image.id, jobId, status: "failed" },
-                data: { status: "pending", errorMessage: null },
-            });
-            if (result.count > 0) claimed.push(image.id);
-        }
-        if (claimed.length > 0) {
-            await tx.processingJob.update({
-                where: { id: jobId },
+    // image twice. Do not steal a fresh publish/rollback lock — that claim is
+    // rolled back with the image updates.
+    let claimedImageIds: string[];
+    try {
+        claimedImageIds = await prisma.$transaction(async (tx) => {
+            const claimed: string[] = [];
+            for (const image of job.images) {
+                const result = await tx.processedImage.updateMany({
+                    where: { id: image.id, jobId, status: "failed" },
+                    data: { status: "pending", errorMessage: null },
+                });
+                if (result.count > 0) claimed.push(image.id);
+            }
+            if (claimed.length === 0) return claimed;
+            const jobUpdate = await tx.processingJob.updateMany({
+                where: workflowLockClaimWhere(jobId),
                 data: { status: "queued", completedAt: null },
             });
+            if (jobUpdate.count === 0) throw new WorkflowLockError();
+            return claimed;
+        });
+    } catch (err) {
+        if (err instanceof WorkflowLockError) {
+            return redirect(`/app/jobs/${jobId}?error=rollback-in-progress`);
         }
-        return claimed;
-    });
+        throw err;
+    }
 
     if (claimedImageIds.length === 0) return redirect(`/app/jobs/${jobId}`);
     const claimedImages = job.images.filter((image) => claimedImageIds.includes(image.id));
@@ -95,12 +106,28 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
                 },
             })
             .catch(() => undefined);
-        // Only flip the parent job to `failed` if EVERY retry attempt failed.
-        // If some succeeded, let the worker finalize the job naturally.
+        // Every claimed retry failed to enqueue. Reconcile from image rows
+        // when nothing is still in flight, so a mixed job is not labeled
+        // failed and dropped out of review. Leave `queued` alone if other
+        // images are still pending — the worker will settle those.
         if (enqueueFailures.length === claimedImages.length) {
-            await prisma.processingJob
-                .update({ where: { id: jobId }, data: { status: "failed" } })
-                .catch(() => undefined);
+            const images = await prisma.processedImage.findMany({
+                where: { jobId },
+                select: { status: true },
+            });
+            const counts = countStatuses(images);
+            const inFlight = (counts.pending ?? 0) + (counts.processing ?? 0);
+            if (inFlight === 0) {
+                await prisma.processingJob
+                    .updateMany({
+                        where: workflowLockClaimWhere(jobId),
+                        data: {
+                            status: resolveSettledJobStatus(counts),
+                            completedAt: new Date(),
+                        },
+                    })
+                    .catch(() => undefined);
+            }
             return redirect(`/app/jobs/${jobId}?error=queue-unavailable`);
         }
         return redirect(`/app/jobs/${jobId}?error=queue-partial`);

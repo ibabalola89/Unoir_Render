@@ -143,7 +143,27 @@ export function getPreviewErrorMessage(error: string | null): string | null {
     }
 }
 
-export function getSafeImageMessage(status: string): string {
+export const PUBLISH_RECONCILE_REQUIRED_MESSAGE =
+    "This image may already be on the product. It has no publish stamp and no saved Shopify file, so nothing new was published.";
+
+export const PUBLISH_OUTCOME_UNKNOWN_MESSAGE =
+    "A previous publish may already have added this file. Nothing new was published. Publish again to check the product gallery.";
+
+export const PUBLISH_AMBIGUOUS_MATCH_MESSAGE =
+    "More than one Shopify image matches this result. Nothing new was published.";
+
+export const PUBLISH_INCOMPLETE_GALLERY_MESSAGE =
+    "Shopify's product gallery could not be fully checked, so nothing new was published.";
+
+const SAFE_PUBLISH_MESSAGES = new Set([
+    PUBLISH_RECONCILE_REQUIRED_MESSAGE,
+    PUBLISH_OUTCOME_UNKNOWN_MESSAGE,
+    PUBLISH_AMBIGUOUS_MATCH_MESSAGE,
+    PUBLISH_INCOMPLETE_GALLERY_MESSAGE,
+]);
+
+export function getSafeImageMessage(status: string, errorMessage?: string | null): string {
+    if (errorMessage && SAFE_PUBLISH_MESSAGES.has(errorMessage)) return errorMessage;
     if (status === "failed_publish") {
         return "Shopify could not finish publishing this image. Retry publish when ready.";
     }

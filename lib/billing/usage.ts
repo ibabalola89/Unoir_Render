@@ -1,12 +1,13 @@
 /**
  * Billing usage helpers (Phase 6).
  *
- * "Usage" = count of `ProcessedImage` rows for this shop, in the current
- * calendar month (UTC), whose status reflects a *consumed* remove.bg credit.
+ * "Usage" = one premium export per `ProcessedImage` row for this shop, in
+ * the current calendar month (UTC).
  *
- * Statuses that count: anything not listed in NON_COUNTING_STATUSES. Pending
- * and processing rows intentionally reserve quota at enqueue time.
- * Statuses that do NOT count: failed, canceled.
+ * A row reserves its export at creation (`pending` / `processing`) and keeps
+ * it through failure and retry. Retry reuses the same row, so it does not
+ * consume a second export and is not blocked when the monthly cap is reached.
+ * `canceled` releases the export. New jobs are still hard-capped.
  *
  * Quotas are hardcoded per V1 scope (Free=20, Starter=500). See plans.ts.
  */
@@ -23,13 +24,16 @@ import {
 type UsageClient = Pick<typeof prisma, "processedImage">;
 
 /**
- * Statuses that do NOT count toward usage. Everything else (pending,
- * processing, processed, approved, rejected, published) is counted as a
- * consumed credit — `pending`/`processing` matter because we need to lock in
- * the quota at enqueue time, not after bg-removal completes (otherwise a
- * merchant can queue 20 + 20 in quick succession and overshoot).
+ * Statuses that release a premium export. Everything else counts as one
+ * export for that row, including `failed`. Retry moves a failed row back to
+ * `pending` without creating a second row, so usage does not increase.
+ * `pending` / `processing` still reserve the export at enqueue time.
  */
-export const NON_COUNTING_STATUSES = ["failed", "canceled"];
+export const NON_COUNTING_STATUSES = ["canceled"] as const;
+
+export function imageCountsAsPremiumExport(status: string): boolean {
+    return !(NON_COUNTING_STATUSES as readonly string[]).includes(status);
+}
 
 function startOfMonthUTC(now = new Date()): Date {
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
@@ -42,7 +46,7 @@ export async function getMonthlyUsage(
     return client.processedImage.count({
         where: {
             job: { shop },
-            status: { notIn: NON_COUNTING_STATUSES },
+            status: { notIn: [...NON_COUNTING_STATUSES] },
             createdAt: { gte: startOfMonthUTC() },
         },
     });

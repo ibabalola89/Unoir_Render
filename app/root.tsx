@@ -1,5 +1,5 @@
+import type { LinksFunction } from "@remix-run/node";
 import {
-  type LinksFunction,
   Links,
   Meta,
   Outlet,

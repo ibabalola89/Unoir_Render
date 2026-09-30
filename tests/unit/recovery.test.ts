@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { recoverStuckProcessingImages } from "../../lib/queue/recovery";
+import {
+    decideProviderRecovery,
+    PROVIDER_IN_FLIGHT_MS,
+    recoverStuckProcessingImages,
+} from "../../lib/queue/recovery";
 
 function makeDb({
     candidates = [],
@@ -13,6 +17,8 @@ function makeDb({
         originalUrl: string;
         shopifyMediaId: string;
         recoveryAttempts?: number;
+        processedKey?: string | null;
+        providerStartedAt?: Date | null;
         job: { shop: string; background: string };
     }>;
     claimCount?: number;
@@ -36,6 +42,42 @@ function makeDb({
 }
 
 const now = new Date("2026-05-01T12:00:00.000Z");
+
+describe("decideProviderRecovery", () => {
+    const now = new Date("2026-05-01T12:00:00.000Z");
+
+    it("finishes from a stored result without another provider call", () => {
+        expect(decideProviderRecovery({
+            processedKey: "processed/job/img.jpg",
+            providerStartedAt: new Date(now.getTime() - 1_000),
+            now,
+        })).toBe("finish-stored-result");
+    });
+
+    it("waits while a provider call is still inside the in-flight window", () => {
+        expect(decideProviderRecovery({
+            processedKey: null,
+            providerStartedAt: new Date(now.getTime() - PROVIDER_IN_FLIGHT_MS + 1_000),
+            now,
+        })).toBe("wait-in-flight");
+    });
+
+    it("does not call again after the in-flight window with no stored result", () => {
+        expect(decideProviderRecovery({
+            processedKey: null,
+            providerStartedAt: new Date(now.getTime() - PROVIDER_IN_FLIGHT_MS),
+            now,
+        })).toBe("fail-provider-unknown");
+    });
+
+    it("allows one call only when remove.bg was never started", () => {
+        expect(decideProviderRecovery({
+            processedKey: null,
+            providerStartedAt: null,
+            now,
+        })).toBe("call-provider");
+    });
+});
 
 describe("recoverStuckProcessingImages", () => {
     const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -110,6 +152,86 @@ describe("recoverStuckProcessingImages", () => {
         });
     });
 
+    it("finishes a stored result without re-enqueueing", async () => {
+        const db = makeDb({
+            candidates: [
+                {
+                    id: "img_1",
+                    jobId: "job_1",
+                    originalUrl: "https://cdn.shopify.com/image.jpg",
+                    shopifyMediaId: "gid://shopify/MediaImage/1",
+                    processedKey: "processed/job_1/img_1.jpg",
+                    providerStartedAt: new Date("2026-05-01T11:00:00.000Z"),
+                    job: { shop: "unoir.myshopify.com", background: "white" },
+                },
+            ],
+        });
+        const enqueue = vi.fn();
+
+        const result = await recoverStuckProcessingImages({ db, enqueue, now });
+
+        expect(result).toMatchObject({ recovered: 1, failed: 0, skipped: 0 });
+        expect(enqueue).not.toHaveBeenCalled();
+        expect(db.processedImage.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({
+                data: expect.objectContaining({ status: "processed", providerStartedAt: null }),
+            }),
+        );
+    });
+
+    it("fails an expired provider call instead of sending it again", async () => {
+        const db = makeDb({
+            candidates: [
+                {
+                    id: "img_1",
+                    jobId: "job_1",
+                    originalUrl: "https://cdn.shopify.com/image.jpg",
+                    shopifyMediaId: "gid://shopify/MediaImage/1",
+                    processedKey: null,
+                    providerStartedAt: new Date("2026-05-01T11:00:00.000Z"),
+                    job: { shop: "unoir.myshopify.com", background: "white" },
+                },
+            ],
+        });
+        const enqueue = vi.fn();
+
+        const result = await recoverStuckProcessingImages({ db, enqueue, now });
+
+        expect(result).toMatchObject({ recovered: 0, failed: 1, failedImageIds: ["img_1"] });
+        expect(enqueue).not.toHaveBeenCalled();
+        expect(db.processedImage.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({
+                data: expect.objectContaining({
+                    status: "failed",
+                    recoveryReason: "provider-call-not-replayed",
+                }),
+            }),
+        );
+    });
+
+    it("waits out a provider call that is still inside the in-flight window", async () => {
+        const db = makeDb({
+            candidates: [
+                {
+                    id: "img_1",
+                    jobId: "job_1",
+                    originalUrl: "https://cdn.shopify.com/image.jpg",
+                    shopifyMediaId: "gid://shopify/MediaImage/1",
+                    processedKey: null,
+                    providerStartedAt: new Date(now.getTime() - 1_000),
+                    job: { shop: "unoir.myshopify.com", background: "white" },
+                },
+            ],
+        });
+        const enqueue = vi.fn();
+
+        const result = await recoverStuckProcessingImages({ db, enqueue, now });
+
+        expect(result).toMatchObject({ recovered: 0, failed: 0, skipped: 1 });
+        expect(enqueue).not.toHaveBeenCalled();
+        expect(db.processedImage.updateMany).not.toHaveBeenCalled();
+    });
+
     it("skips rows that were claimed by another worker first", async () => {
         const db = makeDb({
             claimCount: 0,
@@ -160,8 +282,8 @@ describe("recoverStuckProcessingImages", () => {
             }),
         );
         expect(enqueue).not.toHaveBeenCalled();
-        expect(db.processingJob.update).toHaveBeenCalledWith({
-            where: { id: "job_1" },
+        expect(db.processingJob.updateMany).toHaveBeenCalledWith({
+            where: { id: "job_1", status: { in: ["queued", "processing"] } },
             data: { status: "failed", completedAt: expect.any(Date) },
         });
     });
@@ -201,8 +323,8 @@ describe("recoverStuckProcessingImages", () => {
             }),
         );
         expect(enqueue).not.toHaveBeenCalled();
-        expect(db.processingJob.update).toHaveBeenCalledWith({
-            where: { id: "job_1" },
+        expect(db.processingJob.updateMany).toHaveBeenCalledWith({
+            where: { id: "job_1", status: { in: ["queued", "processing"] } },
             data: { status: "failed", completedAt: expect.any(Date) },
         });
     });
@@ -228,7 +350,7 @@ describe("recoverStuckProcessingImages", () => {
 
         await recoverStuckProcessingImages({ db, enqueue, now });
 
-        expect(db.processingJob.update).not.toHaveBeenCalled();
+        expect(db.processingJob.updateMany).not.toHaveBeenCalled();
     });
 
     it("restores rows to processing and fails startup when recovery enqueue fails", async () => {

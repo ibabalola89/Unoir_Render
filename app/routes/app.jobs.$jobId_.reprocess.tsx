@@ -3,7 +3,7 @@ import { redirect } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { toBackgroundId } from "@lib/backgrounds";
-import { countStatuses, resolveSettledJobStatus } from "@lib/jobs/status";
+import { countStatuses, resolveSettledJobStatus, WorkflowLockError, workflowLockClaimWhere } from "@lib/jobs/status";
 import { enqueueBgRemoval, getBgRemovalQueue } from "@lib/queue";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
 
@@ -38,38 +38,50 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     });
     if (!image) throw new Response("Not found", { status: 404 });
 
-    const claimed = await prisma.processedImage.updateMany({
-        where: { id: image.id, jobId, status: { in: REPROCESSABLE_STATUSES } },
-        data: {
-            status: "pending",
-            processedKey: null,
-            processingStartedAt: null,
-            recoveryAttempts: 0,
-            lastRecoveryAt: null,
-            recoveryReason: null,
-            publishedMediaId: null,
-            publishMode: null,
-            errorMessage: null,
-        },
-    });
-
-    if (claimed.count === 0) {
-        return redirect(`/app/jobs/${jobId}/preview`);
-    }
-
     const background = toBackgroundId(image.job.background);
     if (!background) {
-        await prisma.processedImage.update({
-            where: { id: image.id },
+        await prisma.processedImage.updateMany({
+            where: { id: image.id, jobId, status: { in: REPROCESSABLE_STATUSES } },
             data: { status: "failed", errorMessage: `Unknown background option: ${image.job.background}` },
         });
         return redirect(`/app/jobs/${jobId}/preview`);
     }
 
-    await prisma.processingJob.update({
-        where: { id: jobId },
-        data: { status: "queued", completedAt: null },
-    });
+    let claimed = false;
+    try {
+        claimed = await prisma.$transaction(async (tx) => {
+            const result = await tx.processedImage.updateMany({
+                where: { id: image.id, jobId, status: { in: REPROCESSABLE_STATUSES } },
+                data: {
+                    status: "pending",
+                    processedKey: null,
+                    processingStartedAt: null,
+                    recoveryAttempts: 0,
+                    lastRecoveryAt: null,
+                    recoveryReason: null,
+                    publishedMediaId: null,
+                    publishMode: null,
+                    errorMessage: null,
+                },
+            });
+            if (result.count === 0) return false;
+            const jobUpdate = await tx.processingJob.updateMany({
+                where: workflowLockClaimWhere(jobId),
+                data: { status: "queued", completedAt: null },
+            });
+            if (jobUpdate.count === 0) throw new WorkflowLockError();
+            return true;
+        });
+    } catch (err) {
+        if (err instanceof WorkflowLockError) {
+            return redirect(`/app/jobs/${jobId}/preview?error=publish-in-progress`);
+        }
+        throw err;
+    }
+
+    if (!claimed) {
+        return redirect(`/app/jobs/${jobId}/preview`);
+    }
 
     try {
         await getBgRemovalQueue().remove(image.id).catch(() => undefined);
@@ -107,9 +119,11 @@ async function reconcileAfterReprocessFailure(jobId: string): Promise<void> {
         where: { jobId },
         select: { status: true },
     });
-    const status = resolveSettledJobStatus(countStatuses(images));
-    await prisma.processingJob.update({
-        where: { id: jobId },
-        data: { status, completedAt: new Date() },
+    const counts = countStatuses(images);
+    const inFlight = (counts.pending ?? 0) + (counts.processing ?? 0);
+    if (inFlight > 0) return;
+    await prisma.processingJob.updateMany({
+        where: workflowLockClaimWhere(jobId),
+        data: { status: resolveSettledJobStatus(counts), completedAt: new Date() },
     });
 }

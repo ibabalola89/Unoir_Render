@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
     BillingCheckUnavailableError,
+    imageCountsAsPremiumExport,
     resolveActivePlan,
 } from "../../lib/billing/usage";
 import {
@@ -52,6 +53,18 @@ describe("resolveActivePlan", () => {
             BillingCheckUnavailableError,
         );
         expect(billing.check).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe("imageCountsAsPremiumExport", () => {
+    it("keeps one export on a failed row so retry is not a second charge", () => {
+        for (const status of ["pending", "processing", "processed", "approved", "published", "failed", "failed_publish"]) {
+            expect(imageCountsAsPremiumExport(status)).toBe(true);
+        }
+    });
+
+    it("releases the export only when the image is canceled", () => {
+        expect(imageCountsAsPremiumExport("canceled")).toBe(false);
     });
 });
 

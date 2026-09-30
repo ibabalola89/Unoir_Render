@@ -31,6 +31,13 @@ interface GraphqlResponseShape {
 const MAX_ATTEMPTS = 4;
 const BASE_DELAY_MS = 500;
 
+export class ShopifyGraphqlThrottledError extends Error {
+    constructor() {
+        super(`Shopify GraphQL throttled after ${MAX_ATTEMPTS} attempts`);
+        this.name = "ShopifyGraphqlThrottledError";
+    }
+}
+
 function isThrottled(json: GraphqlResponseShape): boolean {
     // Only retry when *every* error is a throttle. A mixed payload (e.g.
     // THROTTLED + ACCESS_DENIED) is non-recoverable — surface it immediately
@@ -94,7 +101,5 @@ export async function shopifyGraphqlWithRetry<T extends GraphqlResponseShape>(
         }
     }
     if (lastErr) throw lastErr;
-    throw new Error(
-        `Shopify GraphQL throttled after ${MAX_ATTEMPTS} attempts`,
-    );
+    throw new ShopifyGraphqlThrottledError();
 }

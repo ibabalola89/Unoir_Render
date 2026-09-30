@@ -4,12 +4,22 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { getPublishUrl } from "@lib/storage";
 import {
+    altTextWithPublishStamp,
     deletePublishedMedia,
+    findExistingAppMedia,
     promoteMediaToPrimary,
+    publishAttemptMayHaveCreated,
     publishProcessedMedia,
     verifyMediaStatus,
 } from "@lib/shopify/publish";
+import { countStatuses, resolveSettledJobStatus, workflowLockClaimWhere } from "@lib/jobs/status";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
+import {
+    PUBLISH_AMBIGUOUS_MATCH_MESSAGE,
+    PUBLISH_INCOMPLETE_GALLERY_MESSAGE,
+    PUBLISH_OUTCOME_UNKNOWN_MESSAGE,
+    PUBLISH_RECONCILE_REQUIRED_MESSAGE,
+} from "@lib/ui/failureCopy";
 
 /**
  * Publish action.
@@ -29,8 +39,9 @@ import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
  *   any publishing / failed_publish / mixed published rows → partially_published
  *   only approved create failures remaining → completed
  *
- * Re-clicking Publish is idempotent — `approved` rows retry create, `publishing`
- * rows are re-verified (no duplicate productCreateMedia call).
+ * Re-clicking Publish is idempotent — a stored media id or a publish stamp
+ * already on the product is reused. `publishing` rows are re-verified.
+ * A create is not repeated when its result is unknown.
  */
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     await authenticate.admin(request);
@@ -63,21 +74,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return redirect(`/app/jobs/${jobId}/preview?error=unreviewed`);
     }
 
-    // Atomically claim the job. Allowed prior states: completed (first publish),
-    // published / partially_published (re-publish remaining approved + verify
-    // outstanding `publishing` rows). Stale `publishing` jobs older than 5min
-    // are also reclaimable as a recovery hatch if a previous run crashed.
-    const STALE_MS = 5 * 60 * 1000;
+    const actionable = await prisma.processedImage.count({
+        where: { jobId, status: { in: ["approved", "publishing", "failed_publish"] } },
+    });
+    if (actionable === 0) {
+        return redirect(`/app/jobs/${jobId}/preview?error=nothing-approved`);
+    }
+
+    // Claim the parent as the in-flight mutex. Image rows decide what can
+    // publish; a canceled or failed parent must still publish finished,
+    // approved images. A fresh `publishing` lock is left alone. A lock older
+    // than the stale window can be reclaimed after a crashed action.
     const claim = await prisma.processingJob.updateMany({
-        where: {
-            id: jobId,
-            OR: [
-                { status: "completed" },
-                { status: "published" },
-                { status: "partially_published" },
-                { status: "publishing", updatedAt: { lt: new Date(Date.now() - STALE_MS) } },
-            ],
-        },
+        where: workflowLockClaimWhere(jobId),
         data: { status: "publishing" },
     });
     if (claim.count === 0) {
@@ -126,23 +135,113 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
                             continue;
                         }
                         try {
-                            if (image.status === "failed_publish" && image.publishedMediaId) {
-                                await deletePublishedMedia(admin, {
-                                    productId: image.shopifyProductId,
-                                    mediaId: image.publishedMediaId,
-                                }).catch(() => undefined);
+                            let mediaId = image.publishedMediaId;
+                            let createStartedAt = image.publishCreateStartedAt;
+                            // Id was stored before a later write failed. Do not create again.
+                            if (mediaId && image.status !== "failed_publish") {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: {
+                                        status: "publishing",
+                                        publishMode,
+                                        errorMessage: null,
+                                    },
+                                });
+                                continue;
                             }
-                            const sourceUrl = await getPublishUrl(image.processedKey);
-                            const result = await publishProcessedMedia(admin, {
+                            if (image.status === "failed_publish" && mediaId) {
+                                try {
+                                    await deletePublishedMedia(admin, {
+                                        productId: image.shopifyProductId,
+                                        mediaId,
+                                    });
+                                } catch (err) {
+                                    const message = err instanceof Error ? err.message : String(err);
+                                    await prisma.processedImage.update({
+                                        where: { id: image.id },
+                                        data: { errorMessage: message },
+                                    });
+                                    continue;
+                                }
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { publishedMediaId: null, publishCreateStartedAt: null },
+                                });
+                                mediaId = null;
+                                createStartedAt = null;
+                            }
+                            const existing = await findExistingAppMedia(admin, {
                                 productId: image.shopifyProductId,
-                                sourceUrl,
-                                altText: image.shopifyAltText,
+                                processedKey: image.processedKey,
+                                publishStamp: image.publishStamp,
+                            });
+                            if (existing.kind === "ambiguous" || existing.kind === "incomplete") {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: {
+                                        errorMessage: existing.kind === "ambiguous"
+                                            ? PUBLISH_AMBIGUOUS_MATCH_MESSAGE
+                                            : PUBLISH_INCOMPLETE_GALLERY_MESSAGE,
+                                    },
+                                });
+                                continue;
+                            }
+                            if (existing.kind === "found") mediaId = existing.mediaId;
+                            if (!mediaId && !image.publishStamp) {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { errorMessage: PUBLISH_RECONCILE_REQUIRED_MESSAGE },
+                                });
+                                continue;
+                            }
+                            if (!mediaId && createStartedAt) {
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { errorMessage: PUBLISH_OUTCOME_UNKNOWN_MESSAGE },
+                                });
+                                continue;
+                            }
+                            if (!mediaId) {
+                                if (!image.publishStamp) continue;
+                                await prisma.processedImage.update({
+                                    where: { id: image.id },
+                                    data: { publishCreateStartedAt: new Date() },
+                                });
+                                const sourceUrl = await getPublishUrl(image.processedKey);
+                                try {
+                                    const result = await publishProcessedMedia(admin, {
+                                        productId: image.shopifyProductId,
+                                        sourceUrl,
+                                        altText: altTextWithPublishStamp(image.shopifyAltText, image.publishStamp),
+                                    });
+                                    mediaId = result.mediaId;
+                                } catch (err) {
+                                    if (publishAttemptMayHaveCreated(err)) {
+                                        await prisma.processedImage.update({
+                                            where: { id: image.id },
+                                            data: { errorMessage: PUBLISH_OUTCOME_UNKNOWN_MESSAGE },
+                                        });
+                                        continue;
+                                    }
+                                    await prisma.processedImage.update({
+                                        where: { id: image.id },
+                                        data: {
+                                            publishCreateStartedAt: null,
+                                            errorMessage: err instanceof Error ? err.message : String(err),
+                                        },
+                                    });
+                                    continue;
+                                }
+                            }
+                            // Persist the Shopify id before status or primary promotion.
+                            await prisma.processedImage.update({
+                                where: { id: image.id },
+                                data: { publishedMediaId: mediaId },
                             });
                             await prisma.processedImage.update({
                                 where: { id: image.id },
                                 data: {
                                     status: "publishing",
-                                    publishedMediaId: result.mediaId,
                                     publishMode,
                                     errorMessage: null,
                                 },
@@ -211,51 +310,46 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             for (const [mediaId, imageId] of idMap) {
                 const s = statuses.get(mediaId);
                 if (s === "READY") {
+                    const productId = productByMedia.get(mediaId);
+                    const shouldPromote =
+                        Boolean(productId) && publishModeByMedia.get(mediaId) === "replace_primary";
+                    // Mark published first, then promote. Running these together
+                    // let the status write clear a primary-promotion error.
                     updates.push(
-                        prisma.processedImage
-                            .update({
+                        (async () => {
+                            await prisma.processedImage.update({
                                 where: { id: imageId },
                                 data: { status: "published", errorMessage: null },
-                            })
-                            .catch(() => undefined),
-                    );
-                    // Best-effort: promote the new media to position 0 so the
-                    // PDP shows it as the primary image automatically. Failure
-                    // here does NOT undo the publish — the image is live, it
-                    // just isn't primary yet. Keep provider details out of the
-                    // merchant-facing row; log the raw error server-side.
-                    const productId = productByMedia.get(mediaId);
-                    if (productId && publishModeByMedia.get(mediaId) === "replace_primary") {
-                        updates.push(
-                            promoteMediaToPrimary(admin, { productId, mediaId })
-                                .catch((err) => {
-                                    console.error(
-                                        "[publish] failed to promote media to primary",
-                                        {
-                                            jobId,
-                                            productId,
-                                            mediaId,
-                                            error: err instanceof Error ? err.message : String(err),
-                                        },
-                                    );
-                                    emitTelemetryEvent("publish_primary_promotion_failed", {
-                                        shop: session.shop,
+                            });
+                            if (!shouldPromote || !productId) return;
+                            try {
+                                await promoteMediaToPrimary(admin, { productId, mediaId });
+                            } catch (err) {
+                                console.error(
+                                    "[publish] failed to promote media to primary",
+                                    {
                                         jobId,
                                         productId,
                                         mediaId,
-                                        ...serializeError(err),
-                                    }, "warn");
-                                    return prisma.processedImage
-                                        .update({
-                                            where: { id: imageId },
-                                            data: {
-                                                errorMessage: "Published, but primary image update did not complete.",
-                                            },
-                                        })
-                                        .catch(() => undefined);
-                                }),
-                        );
-                    }
+                                        error: err instanceof Error ? err.message : String(err),
+                                    },
+                                );
+                                emitTelemetryEvent("publish_primary_promotion_failed", {
+                                    shop: session.shop,
+                                    jobId,
+                                    productId,
+                                    mediaId,
+                                    ...serializeError(err),
+                                }, "warn");
+                                await prisma.processedImage.updateMany({
+                                    where: { id: imageId, status: "published" },
+                                    data: {
+                                        errorMessage: "Published, but primary image update did not complete.",
+                                    },
+                                });
+                            }
+                        })().catch(() => undefined),
+                    );
                 } else if (s === "FAILED") {
                     emitTelemetryEvent("publish_media_ingest_failed", {
                         shop: session.shop,
@@ -289,19 +383,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 async function reconcileJobStatus(jobId: string): Promise<void> {
-    const [published, approvedRemaining, publishingRemaining, failedPublish] = await Promise.all([
-        prisma.processedImage.count({ where: { jobId, status: "published" } }),
-        prisma.processedImage.count({ where: { jobId, status: "approved" } }),
-        prisma.processedImage.count({ where: { jobId, status: "publishing" } }),
-        prisma.processedImage.count({ where: { jobId, status: "failed_publish" } }),
-    ]);
-    const outstanding = approvedRemaining + publishingRemaining + failedPublish;
-    let next: "published" | "partially_published" | "completed";
-    if (published > 0 && outstanding === 0) next = "published";
-    else if (published > 0 || publishingRemaining > 0 || failedPublish > 0) {
-        next = "partially_published";
-    }
-    else next = "completed";
+    const images = await prisma.processedImage.findMany({
+        where: { jobId },
+        select: { status: true },
+    });
+    const next = resolveSettledJobStatus(countStatuses(images));
     await prisma.processingJob
         .update({ where: { id: jobId }, data: { status: next, completedAt: new Date() } })
         .catch(() => undefined);

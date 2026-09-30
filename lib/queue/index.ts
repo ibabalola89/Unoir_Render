@@ -38,14 +38,31 @@ export function getBgRemovalQueue(): Queue<BgRemovalJobData> {
     return _queue;
 }
 
+const FINISHED_QUEUE_JOB_STATES = new Set(["completed", "failed", "unknown"]);
+
+/**
+ * BullMQ keeps completed and failed jobs when `removeOnComplete` /
+ * `removeOnFail` still retain them. `Queue.add` with the same job id does
+ * not throw and does not requeue — it emits `duplicated` and returns.
+ * Finished jobs must be removed before a merchant retry or recovery add.
+ * Live states (waiting, active, delayed, paused) are left alone so a second
+ * caller cannot start parallel remove.bg work.
+ */
+export function isFinishedQueueJobState(state: string): boolean {
+    return FINISHED_QUEUE_JOB_STATES.has(state);
+}
+
 export async function enqueueBgRemoval(
     data: BgRemovalJobData,
     opts?: JobsOptions,
 ): Promise<void> {
     const queue = getBgRemovalQueue();
-    // Deterministic jobId = ProcessedImage.id. BullMQ rejects duplicate
-    // jobIds, so a double-submit (e.g. retry button mashed) cannot enqueue
-    // the same image twice and burn extra remove.bg credits.
+    const existing = await queue.getJob(data.imageId);
+    if (existing && isFinishedQueueJobState(await existing.getState())) {
+        await existing.remove();
+    }
+    // Deterministic jobId = ProcessedImage.id. A live job with this id is
+    // left in place; a second add is ignored by BullMQ instead of running twice.
     await queue.add(`bg-${data.imageId}`, data, { ...opts, jobId: data.imageId });
 }
 
