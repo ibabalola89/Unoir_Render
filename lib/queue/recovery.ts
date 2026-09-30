@@ -254,14 +254,8 @@ async function reconcileProcessingJob(db: RecoveryPrisma, jobId: string): Promis
     const stillProcessing = (map.pending ?? 0) + (map.processing ?? 0);
     if (stillProcessing > 0) return;
 
-    const job = await db.processingJob.findUnique({
-        where: { id: jobId },
-        select: { status: true },
-    });
-    if (!job || (job.status !== "queued" && job.status !== "processing")) return;
-
-    await db.processingJob.update({
-        where: { id: jobId },
+    await db.processingJob.updateMany({
+        where: { id: jobId, status: { in: ["queued", "processing"] } },
         data: {
             status: resolveSettledJobStatus(map),
             completedAt: new Date(),

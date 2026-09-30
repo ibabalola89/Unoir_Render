@@ -76,7 +76,8 @@ export default function JobStatusRoute() {
     const heroImage = job.images[0];
     const mosaicImages = job.images.slice(1, 6);
     const readyCount = (counts.processed ?? 0) + (counts.approved ?? 0);
-    const failedCount = (counts.failed ?? 0) + (counts.failed_publish ?? 0);
+    const processingFailedCount = counts.failed ?? 0;
+    const failedCount = processingFailedCount + (counts.failed_publish ?? 0);
     const pendingCount = counts.pending ?? 0;
     const processingCount = counts.processing ?? 0;
     const state = getJobState({
@@ -258,10 +259,10 @@ export default function JobStatusRoute() {
                                     </button>
                                 </Form>
                             )}
-                            {failedCount > 0 && (
+                            {processingFailedCount > 0 && (
                                 <Form method="post" action={`/app/jobs/${job.id}/retry`}>
                                     <button className={styles.secondaryAction} type="submit">
-                                        Retry Failed ({failedCount})
+                                        Retry Failed ({processingFailedCount})
                                     </button>
                                 </Form>
                             )}

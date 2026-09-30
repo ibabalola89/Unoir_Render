@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { workflowLockClaimWhere } from "@lib/jobs/status";
 import { deletePublishedMedia } from "@lib/shopify/publish";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
 
@@ -30,18 +31,22 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     });
     if (!owned) throw new Response("Not found", { status: 404 });
 
-    // Atomically claim: rollback can clean fully published jobs, partially
-    // published jobs, and stale `publishing` jobs left by a crashed action.
-    const STALE_MS = 5 * 60 * 1000;
-    const claim = await prisma.processingJob.updateMany({
+    const rollbackable = await prisma.processedImage.count({
         where: {
-            id: jobId,
-            OR: [
-                { status: "published" },
-                { status: "partially_published" },
-                { status: "publishing", updatedAt: { lt: new Date(Date.now() - STALE_MS) } },
-            ],
+            jobId,
+            status: { in: ["published", "publishing", "failed_publish"] },
+            publishedMediaId: { not: null },
         },
+    });
+    if (rollbackable === 0) {
+        return redirect(`/app/jobs/${jobId}`);
+    }
+
+    // Claim the parent as the in-flight mutex. Rollback follows image rows
+    // that still point at Shopify media, including when a retry or cancel
+    // moved the parent off `published`. A fresh `publishing` lock is left alone.
+    const claim = await prisma.processingJob.updateMany({
+        where: workflowLockClaimWhere(jobId),
         data: { status: "publishing" },
     });
     if (claim.count === 0) {

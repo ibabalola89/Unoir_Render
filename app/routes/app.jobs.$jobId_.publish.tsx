@@ -9,6 +9,7 @@ import {
     publishProcessedMedia,
     verifyMediaStatus,
 } from "@lib/shopify/publish";
+import { workflowLockClaimWhere } from "@lib/jobs/status";
 import { emitTelemetryEvent, serializeError } from "@lib/telemetry";
 
 /**
@@ -63,21 +64,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         return redirect(`/app/jobs/${jobId}/preview?error=unreviewed`);
     }
 
-    // Atomically claim the job. Allowed prior states: completed (first publish),
-    // published / partially_published (re-publish remaining approved + verify
-    // outstanding `publishing` rows). Stale `publishing` jobs older than 5min
-    // are also reclaimable as a recovery hatch if a previous run crashed.
-    const STALE_MS = 5 * 60 * 1000;
+    const actionable = await prisma.processedImage.count({
+        where: { jobId, status: { in: ["approved", "publishing", "failed_publish"] } },
+    });
+    if (actionable === 0) {
+        return redirect(`/app/jobs/${jobId}/preview?error=nothing-approved`);
+    }
+
+    // Claim the parent as the in-flight mutex. Image rows decide what can
+    // publish; a canceled or failed parent must still publish finished,
+    // approved images. A fresh `publishing` lock is left alone. A lock older
+    // than the stale window can be reclaimed after a crashed action.
     const claim = await prisma.processingJob.updateMany({
-        where: {
-            id: jobId,
-            OR: [
-                { status: "completed" },
-                { status: "published" },
-                { status: "partially_published" },
-                { status: "publishing", updatedAt: { lt: new Date(Date.now() - STALE_MS) } },
-            ],
-        },
+        where: workflowLockClaimWhere(jobId),
         data: { status: "publishing" },
     });
     if (claim.count === 0) {
@@ -211,51 +210,46 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
             for (const [mediaId, imageId] of idMap) {
                 const s = statuses.get(mediaId);
                 if (s === "READY") {
+                    const productId = productByMedia.get(mediaId);
+                    const shouldPromote =
+                        Boolean(productId) && publishModeByMedia.get(mediaId) === "replace_primary";
+                    // Mark published first, then promote. Running these together
+                    // let the status write clear a primary-promotion error.
                     updates.push(
-                        prisma.processedImage
-                            .update({
+                        (async () => {
+                            await prisma.processedImage.update({
                                 where: { id: imageId },
                                 data: { status: "published", errorMessage: null },
-                            })
-                            .catch(() => undefined),
-                    );
-                    // Best-effort: promote the new media to position 0 so the
-                    // PDP shows it as the primary image automatically. Failure
-                    // here does NOT undo the publish — the image is live, it
-                    // just isn't primary yet. Keep provider details out of the
-                    // merchant-facing row; log the raw error server-side.
-                    const productId = productByMedia.get(mediaId);
-                    if (productId && publishModeByMedia.get(mediaId) === "replace_primary") {
-                        updates.push(
-                            promoteMediaToPrimary(admin, { productId, mediaId })
-                                .catch((err) => {
-                                    console.error(
-                                        "[publish] failed to promote media to primary",
-                                        {
-                                            jobId,
-                                            productId,
-                                            mediaId,
-                                            error: err instanceof Error ? err.message : String(err),
-                                        },
-                                    );
-                                    emitTelemetryEvent("publish_primary_promotion_failed", {
-                                        shop: session.shop,
+                            });
+                            if (!shouldPromote || !productId) return;
+                            try {
+                                await promoteMediaToPrimary(admin, { productId, mediaId });
+                            } catch (err) {
+                                console.error(
+                                    "[publish] failed to promote media to primary",
+                                    {
                                         jobId,
                                         productId,
                                         mediaId,
-                                        ...serializeError(err),
-                                    }, "warn");
-                                    return prisma.processedImage
-                                        .update({
-                                            where: { id: imageId },
-                                            data: {
-                                                errorMessage: "Published, but primary image update did not complete.",
-                                            },
-                                        })
-                                        .catch(() => undefined);
-                                }),
-                        );
-                    }
+                                        error: err instanceof Error ? err.message : String(err),
+                                    },
+                                );
+                                emitTelemetryEvent("publish_primary_promotion_failed", {
+                                    shop: session.shop,
+                                    jobId,
+                                    productId,
+                                    mediaId,
+                                    ...serializeError(err),
+                                }, "warn");
+                                await prisma.processedImage.updateMany({
+                                    where: { id: imageId, status: "published" },
+                                    data: {
+                                        errorMessage: "Published, but primary image update did not complete.",
+                                    },
+                                });
+                            }
+                        })().catch(() => undefined),
+                    );
                 } else if (s === "FAILED") {
                     emitTelemetryEvent("publish_media_ingest_failed", {
                         shop: session.shop,

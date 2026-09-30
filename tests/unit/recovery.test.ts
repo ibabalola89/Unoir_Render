@@ -160,8 +160,8 @@ describe("recoverStuckProcessingImages", () => {
             }),
         );
         expect(enqueue).not.toHaveBeenCalled();
-        expect(db.processingJob.update).toHaveBeenCalledWith({
-            where: { id: "job_1" },
+        expect(db.processingJob.updateMany).toHaveBeenCalledWith({
+            where: { id: "job_1", status: { in: ["queued", "processing"] } },
             data: { status: "failed", completedAt: expect.any(Date) },
         });
     });
@@ -201,8 +201,8 @@ describe("recoverStuckProcessingImages", () => {
             }),
         );
         expect(enqueue).not.toHaveBeenCalled();
-        expect(db.processingJob.update).toHaveBeenCalledWith({
-            where: { id: "job_1" },
+        expect(db.processingJob.updateMany).toHaveBeenCalledWith({
+            where: { id: "job_1", status: { in: ["queued", "processing"] } },
             data: { status: "failed", completedAt: expect.any(Date) },
         });
     });
@@ -228,7 +228,7 @@ describe("recoverStuckProcessingImages", () => {
 
         await recoverStuckProcessingImages({ db, enqueue, now });
 
-        expect(db.processingJob.update).not.toHaveBeenCalled();
+        expect(db.processingJob.updateMany).not.toHaveBeenCalled();
     });
 
     it("restores rows to processing and fails startup when recovery enqueue fails", async () => {

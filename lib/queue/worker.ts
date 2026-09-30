@@ -110,15 +110,11 @@ async function maybeFinalizeJob(jobId: string): Promise<void> {
     // Only set the job status while it's still in a processing-phase state.
     // Once a user starts approving/rejecting/publishing, the lifecycle moves
     // beyond the worker's concern — don't clobber it.
-    const job = await prisma.processingJob.findUnique({
-        where: { id: jobId },
-        select: { status: true },
-    });
-    if (!job || (job.status !== "queued" && job.status !== "processing")) return;
-
     const newStatus = resolveSettledJobStatus(map);
-    await prisma.processingJob.update({
-        where: { id: jobId },
+    // Conditional write: publish/rollback claim the parent as `publishing`.
+    // A finalize that read `queued` before that claim must not overwrite it.
+    await prisma.processingJob.updateMany({
+        where: { id: jobId, status: { in: ["queued", "processing"] } },
         data: { status: newStatus, completedAt: new Date() },
     });
 }
